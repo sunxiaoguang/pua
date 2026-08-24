@@ -17,6 +17,7 @@ import (
 
 	"github.com/disksing/pua/internal/app"
 	"github.com/disksing/pua/internal/buildinfo"
+	"github.com/disksing/pua/internal/schedulerapi"
 )
 
 const (
@@ -51,36 +52,153 @@ func TestVersion(t *testing.T) {
 	}
 }
 
-func TestSchedulerCommandsManageNaturalLanguageSchedules(t *testing.T) {
+func TestSchedulerCommandsUseOwningServerForNativeSchedules(t *testing.T) {
 	withTempCwd(t, func(root string) {
 		run(t, "init")
-		createdOutput := run(t, "scheduler", "add", "--description", "Review release", "--condition", "when the release branch is green", "--target", "workspace")
-		var created app.Schedule
+		workspace, err := app.OpenWorkspace(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		changeRequests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/scheduler"):
+				config, readErr := workspace.Scheduler()
+				if readErr != nil {
+					t.Error(readErr)
+					http.Error(w, readErr.Error(), http.StatusInternalServerError)
+					return
+				}
+				snapshot := app.SchedulerSnapshot{SchemaVersion: config.SchemaVersion, AgentBinding: config.AgentBinding, Schedules: make([]app.ScheduleSnapshot, 0, len(config.Schedules))}
+				for _, schedule := range config.Schedules {
+					snapshot.Schedules = append(snapshot.Schedules, app.ScheduleSnapshot{Schedule: schedule, EffectiveState: schedule.State})
+				}
+				_ = json.NewEncoder(w).Encode(schedulerapi.FromSnapshot(snapshot))
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/scheduler/changes"):
+				changeRequests++
+				var body schedulerChangePayload
+				if decodeErr := json.NewDecoder(r.Body).Decode(&body); decodeErr != nil {
+					t.Error(decodeErr)
+					http.Error(w, decodeErr.Error(), http.StatusBadRequest)
+					return
+				}
+				var schedule app.Schedule
+				var changeErr error
+				expectedRevision := uint64(0)
+				if body.ExpectedRevision != "" {
+					expectedRevision, changeErr = body.ExpectedRevision.Uint64()
+				}
+				switch body.Operation {
+				case app.ScheduleChangeCreate:
+					schedule, changeErr = workspace.AddSchedule(app.CreateScheduleInput{Description: *body.Description, Condition: *body.Condition, Target: *body.Target, Trigger: body.Trigger})
+				case app.ScheduleChangeUpdate:
+					if changeErr == nil {
+						schedule, changeErr = workspace.UpdateSchedule(app.UpdateScheduleInput{ID: body.ID, ExpectedRevision: expectedRevision, Description: body.Description, Condition: body.Condition, Guard: body.Guard, Target: body.Target, Trigger: body.Trigger})
+					}
+				case app.ScheduleChangePause:
+					schedule, changeErr = workspace.PauseSchedule(body.ID)
+				case app.ScheduleChangeResume:
+					schedule, changeErr = workspace.ResumeSchedule(body.ID)
+				case app.ScheduleChangeRemove:
+					schedule, changeErr = workspace.RemoveSchedule(body.ID)
+				}
+				if changeErr != nil {
+					http.Error(w, changeErr.Error(), http.StatusBadRequest)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(schedulerapi.FromSchedule(schedule))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		lock, err := json.Marshal(map[string]any{"pid": os.Getpid(), "address": server.URL, "workspacePath": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, ".pua", "serve.lock"), lock, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		at := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+		createdOutput := run(t, "scheduler", "add", "--description", "Review release", "--condition", "at the agreed review time", "--target", "workspace", "--at", at)
+		var created schedulerapi.Schedule
 		if err := json.Unmarshal([]byte(createdOutput), &created); err != nil {
 			t.Fatal(err)
 		}
-		if created.ID == "" || created.Description != "Review release" || created.Target != "workspace" {
+		if created.ID == "" || created.Revision != "1" || created.Trigger == nil || created.Target != "workspace" {
 			t.Fatalf("created schedule = %#v", created)
 		}
 		listed := run(t, "scheduler", "list")
-		if !strings.Contains(listed, created.ID+"\tReview release\twhen the release branch is green\tworkspace") {
+		if !strings.Contains(listed, created.ID+"\t1\tactive\tat ") {
 			t.Fatalf("schedule list = %q", listed)
 		}
-		updatedOutput := run(t, "scheduler", "update", "--id="+created.ID, "--condition=after 10:00 when the release branch is green", "--target=scheduler")
-		var updated app.Schedule
+		for name, test := range map[string]struct {
+			args []string
+			want string
+		}{
+			"missing trigger": {
+				args: []string{"scheduler", "update", "--id=" + created.ID, "--revision=1", "--condition=at the agreed time when the release branch is green"},
+				want: schedulerUpdateUsage,
+			},
+			"incomplete trigger": {
+				args: []string{"scheduler", "update", "--id=" + created.ID, "--revision=1", "--every=5m"},
+				want: "--every and --anchor are required together",
+			},
+			"mixed triggers": {
+				args: []string{"scheduler", "update", "--id=" + created.ID, "--revision=1", "--at=" + at, "--cron=0 0 9 * * *", "--timezone=UTC"},
+				want: "exactly one trigger form is required",
+			},
+			"Scheduler self-target": {
+				args: []string{"scheduler", "update", "--id=" + created.ID, "--revision=1", "--target=scheduler", "--at=" + at},
+				want: app.ErrScheduleTargetScheduler.Error(),
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				if _, err := runErr(t, test.args...); err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("scheduler update error = %v, want %q", err, test.want)
+				}
+				if changeRequests != 1 {
+					t.Fatalf("scheduler change requests = %d, want create only", changeRequests)
+				}
+			})
+		}
+
+		updatedAt := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339Nano)
+		updatedOutput := run(t, "scheduler", "update", "--id="+created.ID, "--revision=1", "--condition=at the agreed time when the release branch is green", "--target=workspace", "--at="+updatedAt)
+		var updated schedulerapi.Schedule
 		if err := json.Unmarshal([]byte(updatedOutput), &updated); err != nil {
 			t.Fatal(err)
 		}
-		if updated.Condition != "after 10:00 when the release branch is green" || updated.Target != app.SchedulerResourceID || updated.CreatedAt != created.CreatedAt {
+		if updated.Revision != "2" || updated.Condition != "at the agreed time when the release branch is green" || updated.Target != "workspace" || updated.CreatedAt != created.CreatedAt || updated.Trigger == nil || updated.Trigger.At != updatedAt {
 			t.Fatalf("updated schedule = %#v", updated)
 		}
+		triggerOnlyAt := time.Now().UTC().Add(3 * time.Hour).Format(time.RFC3339Nano)
+		triggerOnlyOutput := run(t, "scheduler", "update", "--id="+created.ID, "--revision=2", "--at="+triggerOnlyAt)
+		var triggerOnly schedulerapi.Schedule
+		if err := json.Unmarshal([]byte(triggerOnlyOutput), &triggerOnly); err != nil {
+			t.Fatal(err)
+		}
+		if triggerOnly.Revision != "3" || triggerOnly.Description != updated.Description || triggerOnly.Condition != updated.Condition || triggerOnly.Target != updated.Target || triggerOnly.Trigger == nil || triggerOnly.Trigger.At != triggerOnlyAt {
+			t.Fatalf("trigger-only update changed unrelated fields = %#v", triggerOnly)
+		}
 		shown := run(t, "scheduler", "show", "--id", created.ID)
-		if !strings.Contains(shown, `"target": "scheduler"`) {
+		if !strings.Contains(shown, `"target": "workspace"`) {
 			t.Fatalf("schedule show = %s", shown)
 		}
 		jsonList := run(t, "scheduler", "list", "--json")
-		if !strings.Contains(jsonList, `"wakeIntervalMinutes": 30`) || !strings.Contains(jsonList, created.ID) {
+		if strings.Contains(jsonList, "wakeIntervalMinutes") || !strings.Contains(jsonList, created.ID) {
 			t.Fatalf("JSON schedule list = %s", jsonList)
+		}
+		pausedOutput := run(t, "scheduler", "pause", "--id="+created.ID)
+		var paused schedulerapi.Schedule
+		if err := json.Unmarshal([]byte(pausedOutput), &paused); err != nil || paused.State != app.ScheduleStatePaused || paused.Revision != "4" {
+			t.Fatalf("paused schedule = %#v, %v", paused, err)
+		}
+		resumedOutput := run(t, "scheduler", "resume", "--id="+created.ID)
+		var resumed schedulerapi.Schedule
+		if err := json.Unmarshal([]byte(resumedOutput), &resumed); err != nil || resumed.State != app.ScheduleStateActive || resumed.Revision != "5" {
+			t.Fatalf("resumed schedule = %#v, %v", resumed, err)
 		}
 		removed := run(t, "scheduler", "remove", "--id="+created.ID)
 		if !strings.Contains(removed, created.ID) || strings.TrimSpace(run(t, "scheduler", "list")) != "" {
@@ -90,6 +208,281 @@ func TestSchedulerCommandsManageNaturalLanguageSchedules(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestSchedulerCLIRevisionTransportPreservesUint64(t *testing.T) {
+	withTempCwd(t, func(root string) {
+		run(t, "init")
+		const (
+			firstUnsafeRevision = "9007199254740992"
+			maximumRevision     = "18446744073709551615"
+		)
+		at := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+		trigger := &app.ScheduleTrigger{Type: app.ScheduleTriggerAt, At: at}
+		schedules := []schedulerapi.ScheduleSnapshot{
+			{Schedule: schedulerapi.Schedule{ID: "schedule-111111111111111111111111", Revision: firstUnsafeRevision, Description: "Unsafe", Condition: "later", Target: "workspace", State: app.ScheduleStateActive, Trigger: trigger}, EffectiveState: app.ScheduleStateActive},
+			{Schedule: schedulerapi.Schedule{ID: "schedule-222222222222222222222222", Revision: maximumRevision, Description: "Maximum", Condition: "later", Target: "workspace", State: app.ScheduleStateActive, Trigger: trigger}, EffectiveState: app.ScheduleStateActive},
+		}
+		var received []schedulerapi.Revision
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/scheduler"):
+				_ = json.NewEncoder(w).Encode(schedulerapi.Snapshot{SchemaVersion: 2, AgentBinding: app.AgentBinding{Kind: "profile", Name: "default"}, Schedules: schedules})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/scheduler/changes"):
+				var body schedulerChangePayload
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				received = append(received, body.ExpectedRevision)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				code, message := "schedule_revision_conflict", "revision conflict"
+				if body.ExpectedRevision == maximumRevision {
+					code, message = "schedule_revision_exhausted", app.ErrScheduleRevisionExhausted.Error()
+				}
+				_ = json.NewEncoder(w).Encode(map[string]string{"code": code, "error": message})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		lock, err := json.Marshal(map[string]any{"pid": os.Getpid(), "address": server.URL, "workspacePath": root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, ".pua", "serve.lock"), lock, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		listed := run(t, "scheduler", "list")
+		if !strings.Contains(listed, schedules[0].ID+"\t"+firstUnsafeRevision+"\t") || !strings.Contains(listed, schedules[1].ID+"\t"+maximumRevision+"\t") {
+			t.Fatalf("lossy Scheduler list:\n%s", listed)
+		}
+		jsonList := run(t, "scheduler", "list", "--json")
+		if !strings.Contains(jsonList, `"revision": "`+firstUnsafeRevision+`"`) || !strings.Contains(jsonList, `"revision": "`+maximumRevision+`"`) {
+			t.Fatalf("lossy JSON Scheduler list:\n%s", jsonList)
+		}
+		shown := run(t, "scheduler", "show", "--id="+schedules[1].ID)
+		if !strings.Contains(shown, `"revision": "`+maximumRevision+`"`) {
+			t.Fatalf("lossy Scheduler show:\n%s", shown)
+		}
+		for _, test := range []struct {
+			revision, code string
+		}{
+			{revision: firstUnsafeRevision, code: "schedule_revision_conflict"},
+			{revision: maximumRevision, code: "schedule_revision_exhausted"},
+		} {
+			_, err := runErr(t, "scheduler", "update", "--id="+schedules[0].ID, "--revision="+test.revision, "--at="+at)
+			if err == nil || !strings.Contains(err.Error(), test.code) {
+				t.Fatalf("revision %s error = %v, want %s", test.revision, err, test.code)
+			}
+		}
+		if len(received) != 2 || received[0] != firstUnsafeRevision || received[1] != maximumRevision {
+			t.Fatalf("Scheduler update revisions = %#v", received)
+		}
+	})
+}
+
+func TestSchedulerMutationCommandsSurfaceNotFoundCode(t *testing.T) {
+	withTempCwd(t, func(root string) {
+		run(t, "init")
+		missingID := "schedule-ffffffffffffffffffffffff"
+		var received []app.ScheduleChangeOperation
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/scheduler/changes") {
+				http.NotFound(w, r)
+				return
+			}
+			var body schedulerChangePayload
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if body.ID != missingID {
+				t.Errorf("schedule id = %q, want %q", body.ID, missingID)
+			}
+			received = append(received, body.Operation)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"code": "schedule_not_found", "error": "schedule not found: " + missingID,
+			})
+		}))
+		defer server.Close()
+		lock, err := json.Marshal(map[string]any{
+			"pid": os.Getpid(), "address": server.URL, "workspacePath": root,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, ".pua", "serve.lock"), lock, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		operations := []struct {
+			name string
+			want app.ScheduleChangeOperation
+			args []string
+		}{
+			{name: "update", want: app.ScheduleChangeUpdate, args: []string{"scheduler", "update", "--id=" + missingID, "--revision=18446744073709551615", "--at=9999-08-30T12:00:00Z"}},
+			{name: "pause", want: app.ScheduleChangePause, args: []string{"scheduler", "pause", "--id=" + missingID}},
+			{name: "resume", want: app.ScheduleChangeResume, args: []string{"scheduler", "resume", "--id=" + missingID}},
+			{name: "remove", want: app.ScheduleChangeRemove, args: []string{"scheduler", "remove", "--id=" + missingID}},
+		}
+		for _, operation := range operations {
+			t.Run(operation.name, func(t *testing.T) {
+				_, err := runErr(t, operation.args...)
+				want := "PUA Server schedule_not_found: schedule not found: " + missingID
+				if err == nil || err.Error() != want {
+					t.Fatalf("scheduler %s error = %v, want %q", operation.name, err, want)
+				}
+				if len(received) == 0 || received[len(received)-1] != operation.want {
+					t.Fatalf("scheduler %s request operations = %#v", operation.name, received)
+				}
+			})
+		}
+	})
+}
+
+func TestSchedulerTriggerOptionsAreStructuredAndUnambiguous(t *testing.T) {
+	interval, present, err := schedulerTriggerFromOptions(map[string]string{"every": "5m", "anchor": "2026-08-23T09:00:00+08:00"})
+	if err != nil || !present || interval.Type != app.ScheduleTriggerInterval || interval.EverySeconds != 300 {
+		t.Fatalf("interval trigger = %#v, present=%v, err=%v", interval, present, err)
+	}
+	cron, present, err := schedulerTriggerFromOptions(map[string]string{"cron": "0 0 9 * * *", "timezone": "Asia/Shanghai"})
+	if err != nil || !present || cron.Type != app.ScheduleTriggerCron {
+		t.Fatalf("cron trigger = %#v, present=%v, err=%v", cron, present, err)
+	}
+	for name, values := range map[string]map[string]string{
+		"mixed forms":       {"at": "2026-08-23T09:00:00Z", "cron": "0 0 9 * * *", "timezone": "UTC"},
+		"missing anchor":    {"every": "5m"},
+		"sub-minute":        {"every": "59s", "anchor": "2026-08-23T09:00:00Z"},
+		"implicit timezone": {"cron": "0 0 9 * * *", "timezone": "Local"},
+	} {
+		if _, _, err := schedulerTriggerFromOptions(values); err == nil {
+			t.Fatalf("%s unexpectedly accepted", name)
+		}
+	}
+	parsed, err := parseSchedulerOptions([]string{"--guard="}, map[string]bool{"guard": true})
+	if err != nil || parsed["guard"] != "" {
+		t.Fatalf("empty guard cannot clear optional predicate: %#v, %v", parsed, err)
+	}
+}
+
+func TestSchedulerUpdateValidatesTriggerBeforeOwnerDiscovery(t *testing.T) {
+	withTempCwd(t, func(_ string) {
+		for name, test := range map[string]struct {
+			args []string
+			want string
+		}{
+			"missing trigger": {
+				args: []string{"scheduler", "update", "--id=schedule-1", "--revision=1", "--condition=changed"},
+				want: schedulerUpdateUsage,
+			},
+			"incomplete trigger": {
+				args: []string{"scheduler", "update", "--id=schedule-1", "--revision=1", "--every=5m"},
+				want: "--every and --anchor are required together",
+			},
+			"mixed triggers": {
+				args: []string{"scheduler", "update", "--id=schedule-1", "--revision=1", "--at=2026-08-23T09:00:00Z", "--cron=0 0 9 * * *", "--timezone=UTC"},
+				want: "exactly one trigger form is required",
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				if _, err := runErr(t, test.args...); err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("scheduler update error = %v, want %q", err, test.want)
+				}
+			})
+		}
+	})
+}
+
+func TestSchedulerValidatesCommandsBeforeOwnerDiscovery(t *testing.T) {
+	t.Setenv(puaWorkspaceRootEnvironment, "")
+	t.Setenv(puaWorkspaceInstanceEnvironment, "")
+	t.Setenv(puaResourceIDEnvironment, "")
+	withTempCwd(t, func(_ string) {
+		validAt := "2030-08-23T09:00:00Z"
+		for _, test := range []struct {
+			name string
+			args []string
+			want string
+		}{
+			{name: "unknown subcommand", args: []string{"scheduler", "frobnicate"}, want: `unknown scheduler subcommand "frobnicate"`},
+			{name: "unknown subcommand before server parsing", args: []string{"scheduler", "frobnicate", "--server"}, want: `unknown scheduler subcommand "frobnicate"`},
+			{name: "duplicate list flag", args: []string{"scheduler", "list", "--json", "--json"}, want: "usage: pua scheduler list [--json] [--server=<url>]"},
+			{name: "unknown list flag", args: []string{"scheduler", "list", "--yaml"}, want: "usage: pua scheduler list [--json] [--server=<url>]"},
+			{name: "missing show id", args: []string{"scheduler", "show"}, want: schedulerShowUsage},
+			{name: "unknown add option", args: []string{"scheduler", "add", "--description=Review", "--condition=At review time", "--target=workspace", "--at=" + validAt, "--yaml=true"}, want: schedulerAddUsage},
+			{name: "Scheduler self-target add", args: []string{"scheduler", "add", "--description=Review", "--condition=At review time", "--target=scheduler", "--at=" + validAt}, want: app.ErrScheduleTargetScheduler.Error()},
+			{name: "incomplete add trigger", args: []string{"scheduler", "add", "--description=Review", "--condition=At review time", "--target=workspace", "--every=5m"}, want: "--every and --anchor are required together"},
+			{name: "missing update revision", args: []string{"scheduler", "update", "--id=schedule-1", "--at=" + validAt}, want: schedulerUpdateUsage},
+			{name: "zero update revision", args: []string{"scheduler", "update", "--id=schedule-1", "--revision=0", "--at=" + validAt}, want: schedulerUpdateUsage},
+			{name: "leading-zero update revision", args: []string{"scheduler", "update", "--id=schedule-1", "--revision=01", "--at=" + validAt}, want: schedulerUpdateUsage},
+			{name: "overflowing update revision", args: []string{"scheduler", "update", "--id=schedule-1", "--revision=18446744073709551616", "--at=" + validAt}, want: schedulerUpdateUsage},
+			{name: "signed update revision", args: []string{"scheduler", "update", "--id=schedule-1", "--revision=+1", "--at=" + validAt}, want: schedulerUpdateUsage},
+			{name: "missing update trigger", args: []string{"scheduler", "update", "--id=schedule-1", "--revision=1"}, want: schedulerUpdateUsage},
+			{name: "Scheduler self-target update", args: []string{"scheduler", "update", "--id=schedule-1", "--revision=1", "--target=scheduler", "--at=" + validAt}, want: app.ErrScheduleTargetScheduler.Error()},
+			{name: "incomplete update trigger", args: []string{"scheduler", "update", "--id=schedule-1", "--revision=1", "--cron=0 0 9 * * *"}, want: "--cron and --timezone are required together"},
+			{name: "missing pause id", args: []string{"scheduler", "pause"}, want: "usage: pua scheduler pause --id=<schedule> [--server=<url>]"},
+			{name: "missing resume id", args: []string{"scheduler", "resume"}, want: "usage: pua scheduler resume --id=<schedule> [--server=<url>]"},
+			{name: "missing remove id", args: []string{"scheduler", "remove"}, want: schedulerRemoveUsage},
+			{name: "duplicate server", args: []string{"scheduler", "list", "--server=http://127.0.0.1:1", "--server", "http://127.0.0.1:2"}, want: "usage: pua scheduler list [--server=<url>]"},
+			{name: "invalid server URL", args: []string{"scheduler", "list", "--server=ftp://127.0.0.1:1"}, want: `unsupported PUA Server URL scheme "ftp"`},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				if _, err := runErr(t, test.args...); err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("Run(%q) error = %v, want %q", test.args, err, test.want)
+				}
+			})
+		}
+
+		if _, err := runErr(t, "scheduler", "list"); err == nil || !strings.Contains(err.Error(), "could not find AgentWorkspace root; run pua init first") {
+			t.Fatalf("valid scheduler list error = %v, want owner discovery failure", err)
+		}
+	})
+}
+
+func TestSchedulerHelpDescribesNativeCommandSurface(t *testing.T) {
+	topLevelHelp := run(t, "help")
+	for _, marker := range []string{
+		"Manage native structured schedules through the owning pua serve process.",
+		"Subcommands: list, show, add, update, pause, resume, remove.",
+		"require --at, --every with --anchor, or --cron with --timezone",
+		"UI or Scheduler Agent to compile natural-language requests",
+	} {
+		if !strings.Contains(topLevelHelp, marker) {
+			t.Fatalf("top-level help is missing %q:\n%s", marker, topLevelHelp)
+		}
+	}
+
+	schedulerHelp := run(t, "scheduler", "help")
+	for _, command := range []string{"list", "show", "add", "update", "pause", "resume", "remove"} {
+		if !strings.Contains(schedulerHelp, "pua scheduler "+command) {
+			t.Fatalf("scheduler help is missing %q:\n%s", command, schedulerHelp)
+		}
+	}
+	for _, marker := range []string{
+		"pua scheduler update --id=<schedule> --revision=<n> [--description=<text>]",
+		"complete replacement trigger",
+		"CLI add and update accept complete structured triggers only.",
+		"Scheduler Agent to compile natural-language requests",
+	} {
+		if !strings.Contains(schedulerHelp, marker) {
+			t.Fatalf("scheduler help is missing %q:\n%s", marker, schedulerHelp)
+		}
+	}
+
+	for name, help := range map[string]string{"top-level": topLevelHelp, "scheduler": schedulerHelp} {
+		for _, obsolete := range []string{"Manage natural-language schedules", "wake interval", "wakeInterval"} {
+			if strings.Contains(help, obsolete) {
+				t.Fatalf("%s help contains obsolete wording %q:\n%s", name, obsolete, help)
+			}
+		}
+	}
 }
 
 func TestUserListShowsWorkspaceProfiles(t *testing.T) {

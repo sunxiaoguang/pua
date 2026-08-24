@@ -1,0 +1,3 @@
+PUA Scheduler migration {{.MessageID}} found {{.Count}} v1 schedule(s) that need native trigger compilation: {{.ScheduleIDs}}.
+
+Read each original condition, then use `pua scheduler update` with its current revision and exactly one structured trigger (`--at`, `--every` plus `--anchor`, or `--cron` plus `--timezone`). Preserve the old definition when details are ambiguous; ask the user in this Turn before changing it. The `scheduler` management resource cannot be an execution target, so ask the user to retarget any historical self-target before compiling it. Do not guess an IANA timezone.

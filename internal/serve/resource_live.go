@@ -324,10 +324,15 @@ func (m *agentManager) handleResourceUpload(w http.ResponseWriter, r *http.Reque
 		writeError(w, &resourceAPIError{Code: "workspace_not_owned", Message: err.Error()}, http.StatusNotFound)
 		return
 	}
-	cwd, err := resourceUploadCwd(workspace, resourceID)
+	err = m.server.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+		cwd, resolveErr := resourceUploadCwd(current, resourceID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		storeAgentUpload(w, r, current.Path, cwd)
+		return nil
+	})
 	if err != nil {
 		writeError(w, err, resourceErrorStatus(err))
-		return
 	}
-	storeAgentUpload(w, r, workspace.Path, cwd)
 }

@@ -186,7 +186,12 @@ type server struct {
 	agents           *agentManager
 	doctor           *doctorMonitor
 	locks            *workspaceLockManager
-	uiStateMu        sync.Mutex
+	// configMu serializes the commit boundary of every serve-config mutation.
+	// Workspace mutations acquire their handoff barrier before this mutex; no
+	// config transaction may enter a Workspace controller or perform remote
+	// AgentHub work while holding it.
+	configMu  sync.Mutex
+	uiStateMu sync.Mutex
 }
 
 const (
@@ -330,6 +335,9 @@ func Main(args []string) error {
 	// writable HTTP endpoint may touch it.
 	if err := s.acquireConfiguredWorkspaceLocks(); err != nil {
 		return err
+	}
+	if err := s.backfillConfiguredWorkspaceInstanceIDs(); err != nil {
+		return fmt.Errorf("backfill configured Workspace instance ids: %w", err)
 	}
 	if err := s.ensureConfiguredResourceRuntimes(); err != nil {
 		return err
@@ -679,7 +687,7 @@ func (s *server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err, http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, detail)
+		writeJSON(w, schedulerResourceDetailAPIResponse(detail))
 	case "scheduler":
 		s.handleScheduler(w, r, id, parts[2:])
 	case "users":
@@ -776,6 +784,74 @@ func (s *server) validateProfileBinding(binding app.AgentBinding) error {
 	return nil
 }
 
+// revalidateWorkspaceMutation confirms that the Workspace resolved before a
+// mutation was queued is still the same configured Workspace while the
+// caller owns the shared handoff lease. Removal cannot change the
+// configuration or release the advisory lock until that lease is released.
+func (s *server) revalidateWorkspaceMutation(expected serveWorkspace) (serveWorkspace, error) {
+	cfg, err := s.loadConfig()
+	if err != nil {
+		return serveWorkspace{}, err
+	}
+	expectedPath, err := canonicalWorkspacePath(expected.Path)
+	if err != nil {
+		return serveWorkspace{}, err
+	}
+	for _, current := range cfg.Workspaces {
+		if current.ID != expected.ID {
+			continue
+		}
+		currentPath, pathErr := canonicalWorkspacePath(current.Path)
+		if pathErr != nil || currentPath != expectedPath ||
+			(strings.TrimSpace(expected.InstanceID) != "" && strings.TrimSpace(current.InstanceID) != strings.TrimSpace(expected.InstanceID)) {
+			return serveWorkspace{}, &resourceAPIError{
+				Code:    "workspace_not_owned",
+				Message: fmt.Sprintf("workspace %s changed while the mutation was waiting for ownership", expected.ID),
+			}
+		}
+		if s.locks == nil && strings.TrimSpace(current.InstanceID) == "" {
+			if err := s.requireWorkspaceOwnership(current.Path); err != nil {
+				return serveWorkspace{}, &resourceAPIError{Code: "workspace_not_owned", Message: err.Error()}
+			}
+			return current, nil
+		}
+		if _, err := s.requireWorkspaceInstanceOwnership(current); err != nil {
+			return serveWorkspace{}, err
+		}
+		return current, nil
+	}
+	return serveWorkspace{}, &resourceAPIError{
+		Code:    "workspace_not_owned",
+		Message: fmt.Sprintf("workspace %s is no longer configured by this pua serve instance", expected.ID),
+	}
+}
+
+// withWorkspaceMutation enrolls Server-managed portable and runtime writes in
+// the same Workspace-wide handoff barrier used by resource controllers. The
+// resource controller also preserves existing per-resource serialization.
+func (s *server) withWorkspaceMutation(ctx context.Context, workspace serveWorkspace, resourceID string, mutate func(serveWorkspace) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	run := func() error {
+		current, err := s.revalidateWorkspaceMutation(workspace)
+		if err != nil {
+			return err
+		}
+		if mutate == nil {
+			return nil
+		}
+		return mutate(current)
+	}
+	if s.agents == nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return run()
+	}
+	return s.agents.withResourceController(ctx, workspace, resourceID, run)
+}
+
 func (s *server) updateWorkspaceDefaults(w http.ResponseWriter, r *http.Request, workspaceID string) {
 	var body struct {
 		Project app.AgentBinding `json:"project"`
@@ -799,17 +875,60 @@ func (s *server) updateWorkspaceDefaults(w http.ResponseWriter, r *http.Request,
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	updated, err := puaWorkspace.SetResourceAgentDefaults(defaults)
+	updated, err := s.setWorkspaceDefaults(r.Context(), workspace, defaults)
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
 	writeJSON(w, map[string]any{"resourceDefaults": updated})
+}
+
+// setWorkspaceDefaults serializes fallback changes with native Scheduler
+// reconciliation. An attention-held occurrence has no deadline, so a durable
+// material change requests a prompt pass from the controller job which made
+// the change. Cancelled-before-start, stale, failed, and normalized no-op
+// requests do not disturb the reconcile loop.
+func (s *server) setWorkspaceDefaults(ctx context.Context, workspace serveWorkspace, defaults app.ResourceAgentDefaults) (app.ResourceAgentDefaults, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.agents == nil {
+		if err := ctx.Err(); err != nil {
+			return app.ResourceAgentDefaults{}, err
+		}
+		if err := s.requireWorkspaceOwnership(workspace.Path); err != nil {
+			return app.ResourceAgentDefaults{}, err
+		}
+		puaWorkspace, err := app.OpenWorkspace(workspace.Path)
+		if err != nil {
+			return app.ResourceAgentDefaults{}, err
+		}
+		return puaWorkspace.SetResourceAgentDefaults(defaults)
+	}
+
+	return runSchedulerControllerJob(ctx, s, workspace, func() schedulerControllerJobOutcome[app.ResourceAgentDefaults] {
+		current, err := s.revalidateWorkspaceMutation(workspace)
+		if err != nil {
+			return schedulerControllerJobOutcome[app.ResourceAgentDefaults]{Err: err}
+		}
+		puaWorkspace, err := app.OpenWorkspace(current.Path)
+		if err != nil {
+			return schedulerControllerJobOutcome[app.ResourceAgentDefaults]{Err: err}
+		}
+		previous, err := puaWorkspace.RuntimeConfig()
+		if err != nil {
+			return schedulerControllerJobOutcome[app.ResourceAgentDefaults]{Err: err}
+		}
+		updated, err := puaWorkspace.SetResourceAgentDefaults(defaults)
+		if err != nil {
+			return schedulerControllerJobOutcome[app.ResourceAgentDefaults]{Err: err}
+		}
+		return schedulerControllerJobOutcome[app.ResourceAgentDefaults]{
+			Value: updated, Material: previous.ResourceDefaults != updated,
+		}
+	}, func(app.ResourceAgentDefaults) {
+		s.agents.requestReconcile(reconcileScheduler)
+	})
 }
 
 func (s *server) updateWorkspaceGenerationPolicy(w http.ResponseWriter, r *http.Request, workspaceID string) {
@@ -825,12 +944,15 @@ func (s *server) updateWorkspaceGenerationPolicy(w http.ResponseWriter, r *http.
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	updated, err := puaWorkspace.SetGenerationPolicy(policy)
+	var updated app.GenerationPolicy
+	err = s.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		updated, openErr = puaWorkspace.SetGenerationPolicy(policy)
+		return openErr
+	})
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -851,12 +973,15 @@ func (s *server) updateWorkspaceStallWatchdogPolicy(w http.ResponseWriter, r *ht
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	updated, err := puaWorkspace.SetStallWatchdogPolicy(policy)
+	var updated app.StallWatchdogPolicy
+	err = s.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		updated, openErr = puaWorkspace.SetStallWatchdogPolicy(policy)
+		return openErr
+	})
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -879,12 +1004,15 @@ func (s *server) updateResourceTitle(w http.ResponseWriter, r *http.Request, wor
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	updated, err := puaWorkspace.SetResourceTitle(resourceID, body.Title)
+	var updated string
+	err = s.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		updated, openErr = puaWorkspace.SetResourceTitle(resourceID, body.Title)
+		return openErr
+	})
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -907,12 +1035,15 @@ func (s *server) updateResourceDescription(w http.ResponseWriter, r *http.Reques
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	updated, err := puaWorkspace.SetResourceDescription(resourceID, body.Description)
+	var updated string
+	err = s.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		updated, openErr = puaWorkspace.SetResourceDescription(resourceID, body.Description)
+		return openErr
+	})
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -944,12 +1075,15 @@ func (s *server) updateProjectTaskDefault(w http.ResponseWriter, r *http.Request
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	updated, err := puaWorkspace.SetProjectTaskDefault(resourceID, binding)
+	var updated app.AgentBinding
+	err = s.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		updated, openErr = puaWorkspace.SetProjectTaskDefault(resourceID, binding)
+		return openErr
+	})
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -986,19 +1120,29 @@ func (s *server) updateResourceAgentBinding(w http.ResponseWriter, r *http.Reque
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	updated, err := puaWorkspace.SetResourceAgentBinding(resourceID, binding)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
+	var updated app.AgentBinding
 	if s.agents != nil {
-		if err := s.agents.resourceBindingChanged(r.Context(), workspace, resourceID, updated); err != nil {
-			writeError(w, err, http.StatusBadGateway)
+		var persisted bool
+		updated, persisted, err = s.agents.updateResourceAgentBinding(r.Context(), workspace, resourceID, binding)
+		if err != nil {
+			status := http.StatusBadRequest
+			if persisted {
+				status = http.StatusBadGateway
+			}
+			writeError(w, err, status)
+			return
+		}
+	} else {
+		err = s.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+			puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+			if openErr != nil {
+				return openErr
+			}
+			updated, openErr = puaWorkspace.SetResourceAgentBinding(resourceID, binding)
+			return openErr
+		})
+		if err != nil {
+			writeError(w, err, http.StatusBadRequest)
 			return
 		}
 	}
@@ -1059,12 +1203,15 @@ func (s *server) createProject(w http.ResponseWriter, r *http.Request, id string
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	result, err := puaWorkspace.CreateProject(body.Description, body.Slug)
+	var result app.Project
+	err = s.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		result, openErr = puaWorkspace.CreateProject(body.Description, body.Slug)
+		return openErr
+	})
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -1125,12 +1272,15 @@ func (s *server) createTask(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	result, err := puaWorkspace.CreateTask(createTaskInputFromRequest(body))
+	var result app.Task
+	err = s.withWorkspaceMutation(r.Context(), workspace, body.Project, func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		result, openErr = puaWorkspace.CreateTask(createTaskInputFromRequest(body))
+		return openErr
+	})
 	if err != nil {
 		status := http.StatusBadRequest
 		if app.IsKind(err, "template_conflict") {
@@ -1267,14 +1417,13 @@ func (s *server) archiveResource(w http.ResponseWriter, r *http.Request, id stri
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
 	var archiveResult app.ArchiveResult
 	var archivedResourceIDs []string
-	archive := func() error {
+	archive := func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
 		resourceIDs, resourceIDsErr := archiveResourceIDs(puaWorkspace, resourceID)
 		result, archiveErr := puaWorkspace.ArchiveResource(resourceID)
 		if archiveErr != nil {
@@ -1291,7 +1440,7 @@ func (s *server) archiveResource(w http.ResponseWriter, r *http.Request, id stri
 			result.Warnings = append(result.Warnings, warning)
 		}
 		for _, archivedResourceID := range resourceIDs {
-			if markErr := markResourceMailboxArchived(workspace.Path, archivedResourceID); markErr != nil {
+			if markErr := markResourceMailboxArchived(current.Path, archivedResourceID); markErr != nil {
 				result.Warnings = append(result.Warnings, app.ArchiveWarning{
 					Severity:   "warning",
 					Code:       "runtime_mailbox_mark_failed",
@@ -1301,14 +1450,17 @@ func (s *server) archiveResource(w http.ResponseWriter, r *http.Request, id stri
 			}
 		}
 		archiveResult = result
+		if pruneErr := s.pruneUIStateForArchivedResources(current.Path, archivedResourceIDs); pruneErr != nil {
+			archiveResult.Warnings = append(archiveResult.Warnings, app.ArchiveWarning{
+				Severity:   "warning",
+				Code:       "ui_state_prune_failed",
+				Message:    fmt.Sprintf("resource %s was archived, but its persisted UI state could not be pruned: %v", resourceID, pruneErr),
+				ResourceID: resourceID,
+			})
+		}
 		return nil
 	}
-	var archiveErr error
-	if s.agents != nil {
-		archiveErr = s.agents.withResourceController(r.Context(), workspace, resourceID, archive)
-	} else {
-		archiveErr = archive()
-	}
+	archiveErr := s.withWorkspaceMutation(r.Context(), workspace, resourceID, archive)
 	if archiveErr != nil {
 		status := http.StatusBadRequest
 		if s.agents != nil {
@@ -1319,14 +1471,6 @@ func (s *server) archiveResource(w http.ResponseWriter, r *http.Request, id stri
 		}
 		writeError(w, archiveErr, status)
 		return
-	}
-	if err := s.pruneUIStateForArchivedResources(workspace.Path, archivedResourceIDs); err != nil {
-		archiveResult.Warnings = append(archiveResult.Warnings, app.ArchiveWarning{
-			Severity:   "warning",
-			Code:       "ui_state_prune_failed",
-			Message:    fmt.Sprintf("resource %s was archived, but its persisted UI state could not be pruned: %v", resourceID, err),
-			ResourceID: resourceID,
-		})
 	}
 	// Keep the existing path field while exposing non-blocking conditions to
 	// HTTP/Web callers. Warnings are omitted for the common clean case.
@@ -1503,16 +1647,23 @@ func (s *server) saveWorkspaceAgentsFile(w http.ResponseWriter, r *http.Request,
 		writeError(w, errors.New("AGENTS.md content must be valid UTF-8 text"), http.StatusBadRequest)
 		return
 	}
-	path := filepath.Join(workspace.Path, "AGENTS.md")
-	if err := replaceMarkdownFile(path, content, body.ExpectedContentHash); err != nil {
-		if errors.Is(err, errMarkdownContentConflict) {
-			writeError(w, errors.New("AGENTS.md changed on disk; reconcile the preserved browser draft before saving"), http.StatusConflict)
-			return
+	errorStatus := http.StatusInternalServerError
+	err = s.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+		path := filepath.Join(current.Path, "AGENTS.md")
+		writeErr := replaceMarkdownFile(path, content, body.ExpectedContentHash)
+		if errors.Is(writeErr, errMarkdownContentConflict) {
+			errorStatus = http.StatusConflict
+			return errors.New("AGENTS.md changed on disk; reconcile the preserved browser draft before saving")
 		}
-		writeError(w, err, http.StatusInternalServerError)
+		if writeErr == nil {
+			previewPath(w, relPath, path)
+		}
+		return writeErr
+	})
+	if err != nil {
+		writeError(w, err, errorStatus)
 		return
 	}
-	s.previewFile(w, r, id)
 }
 
 func isHiddenAgentsPath(relPath string) bool {
@@ -1599,6 +1750,10 @@ func (s *server) addWorkspace(ctx context.Context, path string) (serveWorkspace,
 }
 
 func (s *server) addWorkspaceWithOptions(ctx context.Context, path string, create bool, language, initialUserName string) (workspace serveWorkspace, err error) {
+	return s.addWorkspaceWithOptionsAndSave(ctx, path, create, language, initialUserName, s.saveConfigLocked)
+}
+
+func (s *server) addWorkspaceWithOptionsAndSave(ctx context.Context, path string, create bool, language, initialUserName string, save func(config) error) (workspace serveWorkspace, err error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return serveWorkspace{}, errors.New("workspace path is required")
@@ -1662,10 +1817,6 @@ func (s *server) addWorkspaceWithOptions(ctx context.Context, path string, creat
 		Name: workspaceName(tree.Root),
 		Path: tree.Root,
 	}
-	cfg, err := s.loadConfig()
-	if err != nil {
-		return serveWorkspace{}, err
-	}
 	puaWorkspace, err := app.OpenWorkspace(tree.Root)
 	if err != nil {
 		return serveWorkspace{}, err
@@ -1682,27 +1833,47 @@ func (s *server) addWorkspaceWithOptions(ctx context.Context, path string, creat
 			return serveWorkspace{}, baselineErr
 		}
 	}
-	if runtime, runtimeErr := puaWorkspace.RuntimeConfig(); runtimeErr == nil {
-		workspace.InstanceID = runtime.InstanceID
-	}
-	if _, err := puaWorkspace.EnsureResourceRuntime(); err != nil {
+	runtime, err := puaWorkspace.EnsureResourceRuntime()
+	if err != nil {
 		return serveWorkspace{}, err
 	}
-	replaced := false
-	for i := range cfg.Workspaces {
-		if cfg.Workspaces[i].ID == workspace.ID {
-			workspace.Icon = cfg.Workspaces[i].Icon
-			cfg.Workspaces[i] = workspace
-			replaced = true
-			break
+	workspace.InstanceID = strings.TrimSpace(runtime.InstanceID)
+	if workspace.InstanceID == "" {
+		return serveWorkspace{}, errors.New("Workspace resource runtime has no instance id")
+	}
+	_, _, err = s.mutateConfigWithSave(save, func(cfg *config) (bool, error) {
+		replaced := false
+		for i := range cfg.Workspaces {
+			if cfg.Workspaces[i].ID == workspace.ID {
+				// Refresh mutable on-disk metadata at the commit boundary. A
+				// concurrent name mutation writes the Workspace before entering
+				// this config transaction, so either this read observes it or its
+				// later transaction wins without a stale live add reverting it.
+				workspace.Name = workspaceName(tree.Root)
+				workspace.Icon = cfg.Workspaces[i].Icon
+				cfg.Workspaces[i] = workspace
+				replaced = true
+				break
+			}
 		}
-	}
-	if !replaced {
-		cfg.Workspaces = append(cfg.Workspaces, workspace)
-	}
-	cfg.ActiveID = workspace.ID
-	if err := s.saveConfig(cfg); err != nil {
+		if !replaced {
+			cfg.Workspaces = append(cfg.Workspaces, workspace)
+		}
+		cfg.ActiveID = workspace.ID
+		return true, nil
+	})
+	if err != nil {
 		return serveWorkspace{}, err
+	}
+	if s.agents != nil {
+		if err := s.agents.reviveWorkspaceBarrier(workspace.Path); err != nil {
+			return serveWorkspace{}, err
+		}
+		// Configuration persistence makes this Workspace visible to the global
+		// Scheduler deadline projection. Refresh it only after a retired handoff
+		// barrier has been revived, and independently of caller cancellation: at
+		// this point the live add is already durable.
+		s.agents.requestReconcile(reconcileScheduler)
 	}
 	if s.doctor != nil {
 		s.doctor.requestScan()
@@ -1719,18 +1890,102 @@ func (s *server) ensureConfiguredResourceRuntimes() error {
 		if !s.ownsWorkspace(workspace.Path) {
 			continue
 		}
+		// Startup backfill leaves the identity empty only when a legacy
+		// Workspace is already missing or unreadable. Keep serving so the
+		// stale entry can be removed; all Workspace writes still require a
+		// readable runtime identity and the held advisory lock.
+		configuredInstanceID := strings.TrimSpace(workspace.InstanceID)
+		if configuredInstanceID == "" {
+			continue
+		}
 		puaWorkspace, err := app.OpenWorkspace(workspace.Path)
 		if err != nil {
 			return fmt.Errorf("open Workspace %s for resource runtime: %w", workspace.ID, err)
 		}
-		if _, err := puaWorkspace.EnsureResourceRuntime(); err != nil {
+		runtime, err := puaWorkspace.EnsureResourceRuntime()
+		if err != nil {
 			return fmt.Errorf("initialize Workspace %s resource runtime: %w", workspace.ID, err)
+		}
+		if strings.TrimSpace(runtime.InstanceID) != configuredInstanceID {
+			return fmt.Errorf("Workspace %s instance changed after serve configuration was persisted", workspace.ID)
 		}
 		if _, err := puaWorkspace.EnsureScheduler(); err != nil {
 			return fmt.Errorf("initialize Workspace %s Scheduler: %w", workspace.ID, err)
 		}
 	}
 	return nil
+}
+
+type configuredWorkspaceInstanceBackfillKey struct {
+	id   string
+	path string
+}
+
+func (s *server) backfillConfiguredWorkspaceInstanceIDs() error {
+	return s.backfillConfiguredWorkspaceInstanceIDsWithSave(s.saveConfigLocked)
+}
+
+// backfillConfiguredWorkspaceInstanceIDsWithSave upgrades fixed-base serve
+// configurations before recovery can enqueue any Workspace work. Resolvable
+// IDs are committed together; entries that are already stale remain blank and
+// use the collision-free path removal controller.
+func (s *server) backfillConfiguredWorkspaceInstanceIDsWithSave(save func(config) error) error {
+	cfg, err := s.loadConfig()
+	if err != nil {
+		return err
+	}
+	resolved := make(map[configuredWorkspaceInstanceBackfillKey]string)
+	for _, workspace := range cfg.Workspaces {
+		if strings.TrimSpace(workspace.InstanceID) != "" || !s.ownsWorkspace(workspace.Path) {
+			continue
+		}
+		puaWorkspace, openErr := app.OpenWorkspace(workspace.Path)
+		if openErr != nil {
+			continue
+		}
+		runtime, runtimeErr := puaWorkspace.EnsureResourceRuntime()
+		if runtimeErr != nil || strings.TrimSpace(runtime.InstanceID) == "" {
+			continue
+		}
+		canonical, canonicalErr := canonicalWorkspacePath(workspace.Path)
+		if canonicalErr != nil {
+			continue
+		}
+		resolved[configuredWorkspaceInstanceBackfillKey{id: workspace.ID, path: canonical}] = strings.TrimSpace(runtime.InstanceID)
+	}
+	if len(resolved) == 0 {
+		return nil
+	}
+
+	// Reload inside the serialized commit boundary so settings and Workspace
+	// list mutations cannot be overwritten. Each candidate's path and live
+	// identity are revalidated before it is persisted; a changed entry is left
+	// untouched for the next pass.
+	_, _, err = s.mutateConfigWithSave(save, func(current *config) (bool, error) {
+		changed := false
+		for index := range current.Workspaces {
+			workspace := &current.Workspaces[index]
+			if strings.TrimSpace(workspace.InstanceID) != "" {
+				continue
+			}
+			canonical, canonicalErr := canonicalWorkspacePath(workspace.Path)
+			if canonicalErr != nil {
+				continue
+			}
+			candidate, ok := resolved[configuredWorkspaceInstanceBackfillKey{id: workspace.ID, path: canonical}]
+			if !ok {
+				continue
+			}
+			liveInstanceID, liveErr := workspaceInstanceID(workspace.Path)
+			if liveErr != nil || strings.TrimSpace(liveInstanceID) != candidate {
+				continue
+			}
+			workspace.InstanceID = candidate
+			changed = true
+		}
+		return changed, nil
+	})
+	return err
 }
 
 func (s *server) updateWorkspaceIcon(id, icon string) (serveWorkspace, error) {
@@ -1740,47 +1995,57 @@ func (s *server) updateWorkspaceIcon(id, icon string) (serveWorkspace, error) {
 			return serveWorkspace{}, fmt.Errorf("unknown workspace icon: %s", icon)
 		}
 	}
-	cfg, err := s.loadConfig()
+	workspace, err := s.workspace(id)
 	if err != nil {
 		return serveWorkspace{}, err
 	}
-	for i := range cfg.Workspaces {
-		if cfg.Workspaces[i].ID != id {
-			continue
-		}
-		cfg.Workspaces[i].Icon = icon
-		if err := s.saveConfig(cfg); err != nil {
-			return serveWorkspace{}, err
-		}
-		return cfg.Workspaces[i], nil
-	}
-	return serveWorkspace{}, fmt.Errorf("workspace not found: %s", id)
+	var updated serveWorkspace
+	err = s.withWorkspaceMutation(context.Background(), workspace, "workspace", func(current serveWorkspace) error {
+		_, _, mutateErr := s.mutateConfig(func(cfg *config) (bool, error) {
+			for i := range cfg.Workspaces {
+				if cfg.Workspaces[i].ID != current.ID {
+					continue
+				}
+				cfg.Workspaces[i].Icon = icon
+				updated = cfg.Workspaces[i]
+				return true, nil
+			}
+			return false, fmt.Errorf("workspace not found: %s", id)
+		})
+		return mutateErr
+	})
+	return updated, err
 }
 
 func (s *server) updateWorkspaceName(id, name string) (serveWorkspace, error) {
-	cfg, err := s.loadConfig()
+	workspace, err := s.workspace(id)
 	if err != nil {
 		return serveWorkspace{}, err
 	}
-	for i := range cfg.Workspaces {
-		if cfg.Workspaces[i].ID != id {
-			continue
+	var updated serveWorkspace
+	err = s.withWorkspaceMutation(context.Background(), workspace, "workspace", func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
 		}
-		puaWorkspace, err := app.OpenWorkspace(cfg.Workspaces[i].Path)
-		if err != nil {
-			return serveWorkspace{}, err
+		resolved, setErr := puaWorkspace.SetName(name)
+		if setErr != nil {
+			return setErr
 		}
-		resolved, err := puaWorkspace.SetName(name)
-		if err != nil {
-			return serveWorkspace{}, err
-		}
-		cfg.Workspaces[i].Name = resolved
-		if err := s.saveConfig(cfg); err != nil {
-			return serveWorkspace{}, err
-		}
-		return cfg.Workspaces[i], nil
-	}
-	return serveWorkspace{}, fmt.Errorf("workspace not found: %s", id)
+		_, _, mutateErr := s.mutateConfig(func(cfg *config) (bool, error) {
+			for i := range cfg.Workspaces {
+				if cfg.Workspaces[i].ID != current.ID {
+					continue
+				}
+				cfg.Workspaces[i].Name = resolved
+				updated = cfg.Workspaces[i]
+				return true, nil
+			}
+			return false, fmt.Errorf("workspace not found: %s", id)
+		})
+		return mutateErr
+	})
+	return updated, err
 }
 
 func (s *server) removeWorkspace(id string) error {
@@ -1788,32 +2053,115 @@ func (s *server) removeWorkspace(id string) error {
 	if err != nil {
 		return err
 	}
-	next := cfg.Workspaces[:0]
-	removed := false
-	var removedPath string
+	var removing serveWorkspace
 	for _, workspace := range cfg.Workspaces {
 		if workspace.ID == id {
-			removed = true
-			removedPath = workspace.Path
-			continue
+			removing = workspace
+			break
 		}
-		next = append(next, workspace)
 	}
-	if !removed {
+	if removing.ID == "" {
 		return fmt.Errorf("workspace not found: %s", id)
 	}
-	cfg.Workspaces = next
-	if cfg.ActiveID == id {
-		cfg.ActiveID = ""
-		if len(cfg.Workspaces) > 0 {
-			cfg.ActiveID = cfg.Workspaces[0].ID
-		}
-	}
-	if err := s.saveConfig(cfg); err != nil {
+	expectedPath, err := canonicalWorkspacePath(removing.Path)
+	if err != nil {
 		return err
 	}
-	// The Workspace is no longer managed once it leaves the persisted config;
-	// release the serve lock so another instance can take ownership.
+	controllerInstanceID := strings.TrimSpace(removing.InstanceID)
+	legacyInstanceLookup := controllerInstanceID == ""
+	staleLegacyRemoval := false
+	if legacyInstanceLookup {
+		controllerInstanceID, err = workspaceInstanceID(removing.Path)
+		if err != nil {
+			controllerInstanceID = ""
+			staleLegacyRemoval = true
+		}
+		controllerInstanceID = strings.TrimSpace(controllerInstanceID)
+		if controllerInstanceID == "" && !staleLegacyRemoval {
+			staleLegacyRemoval = true
+		}
+	}
+	remove := func() error {
+		return s.agents.withWorkspaceHandoff(context.Background(), expectedPath, func() error {
+			return s.removeWorkspaceLocked(id, expectedPath, controllerInstanceID, legacyInstanceLookup, staleLegacyRemoval)
+		})
+	}
+	if s.agents == nil {
+		return s.removeWorkspaceLocked(id, expectedPath, controllerInstanceID, legacyInstanceLookup, staleLegacyRemoval)
+	}
+	// The Scheduler controller establishes one outer lock order for Scheduler
+	// delivery and removal. The exclusive Workspace barrier then drains jobs on
+	// every resource controller before config deletion and advisory-lock release;
+	// jobs starting behind the handoff revalidate ownership and fail closed.
+	if staleLegacyRemoval {
+		return s.agents.withStaleWorkspacePathController(context.Background(), expectedPath, app.SchedulerResourceID, remove)
+	}
+	return s.agents.withResourceControllerInstanceID(context.Background(), controllerInstanceID, app.SchedulerResourceID, remove)
+}
+
+func (s *server) removeWorkspaceLocked(id, expectedPath, controllerInstanceID string, legacyInstanceLookup, staleLegacyRemoval bool) error {
+	if err := s.requireWorkspaceRemovalClaim(expectedPath); err != nil {
+		return err
+	}
+	var removedPath string
+	_, _, err := s.mutateConfig(func(cfg *config) (bool, error) {
+		next := cfg.Workspaces[:0]
+		removed := false
+		for _, workspace := range cfg.Workspaces {
+			if workspace.ID == id {
+				if canonical, canonicalErr := canonicalWorkspacePath(workspace.Path); canonicalErr != nil || canonical != expectedPath {
+					return false, fmt.Errorf("workspace %s changed while removal was waiting", id)
+				}
+				configuredInstanceID := strings.TrimSpace(workspace.InstanceID)
+				if staleLegacyRemoval {
+					if configuredInstanceID != "" {
+						return false, fmt.Errorf("workspace %s instance changed while stale removal was waiting", id)
+					}
+					if liveInstanceID, liveErr := workspaceInstanceID(workspace.Path); liveErr == nil && strings.TrimSpace(liveInstanceID) != "" {
+						return false, fmt.Errorf("workspace %s became available while stale removal was waiting", id)
+					}
+				} else if configuredInstanceID == "" && legacyInstanceLookup {
+					liveInstanceID, liveErr := workspaceInstanceID(workspace.Path)
+					if liveErr != nil {
+						return false, fmt.Errorf("verify legacy Workspace %s instance id: %w", id, liveErr)
+					}
+					configuredInstanceID = strings.TrimSpace(liveInstanceID)
+				} else if configuredInstanceID != "" {
+					// An unavailable persisted Workspace is removable, but a newly
+					// readable Workspace at the same path must still be the same
+					// instance. Otherwise this callback belongs to the old controller
+					// and must not release ownership underneath the replacement.
+					liveInstanceID, liveErr := workspaceInstanceID(workspace.Path)
+					if liveErr == nil && strings.TrimSpace(liveInstanceID) != configuredInstanceID {
+						return false, fmt.Errorf("workspace %s live instance changed while removal was waiting", id)
+					}
+				}
+				if !staleLegacyRemoval && configuredInstanceID != controllerInstanceID {
+					return false, fmt.Errorf("workspace %s instance changed while removal was waiting", id)
+				}
+				removed = true
+				removedPath = workspace.Path
+				continue
+			}
+			next = append(next, workspace)
+		}
+		if !removed {
+			return false, fmt.Errorf("workspace not found: %s", id)
+		}
+		cfg.Workspaces = next
+		if cfg.ActiveID == id {
+			cfg.ActiveID = ""
+			if len(cfg.Workspaces) > 0 {
+				cfg.ActiveID = cfg.Workspaces[0].ID
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	// Keep the persisted removal and advisory-lock handoff in the same
+	// Scheduler-controller callback. No stale callback can cross this release.
 	if s.locks != nil {
 		s.locks.release(removedPath)
 	}
@@ -1951,7 +2299,6 @@ func resourceRuntimeGenerationNewer(left, right generationRecord) bool {
 }
 
 func (s *server) resource(ctx context.Context, id string, resourceID string) (app.ResourceDetailView, error) {
-	_ = ctx
 	workspace, err := s.workspace(id)
 	if err != nil {
 		return app.ResourceDetailView{}, err
@@ -1960,7 +2307,22 @@ func (s *server) resource(ctx context.Context, id string, resourceID string) (ap
 	if err != nil {
 		return app.ResourceDetailView{}, err
 	}
-	return puaWorkspace.Resource(resourceID)
+	detail, err := puaWorkspace.Resource(resourceID)
+	if err != nil {
+		return app.ResourceDetailView{}, err
+	}
+	if normalizedResourceID(resourceID) == app.SchedulerResourceID && s.agents != nil {
+		snapshot, snapshotErr := runSchedulerControllerJob(ctx, s, workspace, func() schedulerControllerJobOutcome[app.SchedulerSnapshot] {
+			value, readErr := newNativeScheduler(s.agents, workspace).Snapshot(s.agents.now())
+			return schedulerControllerJobOutcome[app.SchedulerSnapshot]{Value: value, Err: readErr}
+		}, nil)
+		err = snapshotErr
+		if err != nil {
+			return app.ResourceDetailView{}, err
+		}
+		detail.Scheduler = &snapshot
+	}
+	return detail, nil
 }
 
 func (s *server) loadUIState(id string, userNames ...string) (uiState, error) {
@@ -1982,22 +2344,24 @@ func (s *server) saveUIState(id string, state uiState, userNames ...string) erro
 	if userName == "" {
 		return &resourceAPIError{Code: "user_required", Message: "select a Workspace user before accessing personal data"}
 	}
-	s.uiStateMu.Lock()
-	defer s.uiStateMu.Unlock()
 	workspace, err := s.workspace(id)
 	if err != nil {
 		return err
 	}
-	// UI navigation updates predate user resource state. Preserve the
-	// server-owned map so an older browser cannot overwrite read cursors.
-	statePath := userUIStatePath(workspace.Path, userName)
-	existing, err := loadUIStateFile(statePath)
-	if err != nil {
-		return err
-	}
-	state.ResourceStates = existing.ResourceStates
-	state.Attention = existing.Attention
-	return saveUIStateFile(statePath, state)
+	return s.withWorkspaceMutation(context.Background(), workspace, "workspace", func(current serveWorkspace) error {
+		s.uiStateMu.Lock()
+		defer s.uiStateMu.Unlock()
+		// UI navigation updates predate user resource state. Preserve the
+		// server-owned map so an older browser cannot overwrite read cursors.
+		statePath := userUIStatePath(current.Path, userName)
+		existing, loadErr := loadUIStateFile(statePath)
+		if loadErr != nil {
+			return loadErr
+		}
+		state.ResourceStates = existing.ResourceStates
+		state.Attention = existing.Attention
+		return saveUIStateFile(statePath, state)
+	})
 }
 
 func (s *server) buildDiff(ctx context.Context, worktreePath string, base string) (string, error) {
@@ -2084,6 +2448,14 @@ func (s *server) workspace(id string) (serveWorkspace, error) {
 }
 
 func (s *server) loadConfig() (config, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return s.loadConfigLocked()
+}
+
+// loadConfigLocked may upgrade the file and therefore always runs under
+// configMu, even when the caller only needs a snapshot.
+func (s *server) loadConfigLocked() (config, error) {
 	var cfg config
 	data, err := os.ReadFile(s.config)
 	if err != nil {
@@ -2127,7 +2499,7 @@ func (s *server) loadConfig() (config, error) {
 		needsUpgrade = true
 	}
 	if needsUpgrade {
-		if err := s.saveConfig(cfg); err != nil {
+		if err := s.saveConfigLocked(cfg); err != nil {
 			return config{}, err
 		}
 	}
@@ -2135,6 +2507,12 @@ func (s *server) loadConfig() (config, error) {
 }
 
 func (s *server) saveConfig(cfg config) error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return s.saveConfigLocked(cfg)
+}
+
+func (s *server) saveConfigLocked(cfg config) error {
 	if cfg.Version < agentHubConfigVersion {
 		return fmt.Errorf("unsupported PUA serve configuration version %d", cfg.Version)
 	}
@@ -2160,6 +2538,42 @@ func (s *server) saveConfig(cfg config) error {
 		return err
 	}
 	return atomicWriteConfig(s.config, append(data, '\n'))
+}
+
+// mutateConfig serializes an in-process read-modify-write transaction and
+// reloads the latest file at its commit boundary. Callers must complete slow
+// filesystem discovery, Workspace operations, and AgentHub requests first.
+// The callback must not enter a Workspace controller or call loadConfig or
+// saveConfig: Workspace mutations use the lock order handoff barrier ->
+// configMu.
+func (s *server) mutateConfig(mutate func(*config) (bool, error)) (config, bool, error) {
+	return s.mutateConfigWithSave(s.saveConfigLocked, mutate)
+}
+
+// mutateConfigWithSave is the injectable form used by failure-boundary tests.
+// The writer executes while configMu is held and must not call a locking
+// server config method.
+func (s *server) mutateConfigWithSave(save func(config) error, mutate func(*config) (bool, error)) (config, bool, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	cfg, err := s.loadConfigLocked()
+	if err != nil {
+		return config{}, false, err
+	}
+	changed, err := mutate(&cfg)
+	if err != nil {
+		return config{}, false, err
+	}
+	if !changed {
+		return cfg, false, nil
+	}
+	if save == nil {
+		return config{}, false, errors.New("serve configuration writer is nil")
+	}
+	if err := save(cfg); err != nil {
+		return config{}, false, err
+	}
+	return cfg, true, nil
 }
 
 func defaultConfigPath() (string, error) {

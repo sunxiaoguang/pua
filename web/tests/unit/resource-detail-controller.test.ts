@@ -41,4 +41,5 @@ describe("ResourceDetailController", () => {
 		expect(await pending).toBeNull();
 		expect(details).toEqual({});
 	});
+
 });

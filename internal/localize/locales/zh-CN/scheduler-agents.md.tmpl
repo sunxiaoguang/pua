@@ -1,14 +1,14 @@
 # Scheduler Agent 指引
 
-你正在 AgentWorkspace 的特殊 Scheduler 资源目录中工作。
+你正在 AgentWorkspace 的特殊 Scheduler 资源目录中工作。你是调度管理和自然语言编译入口；编译完成后的时间规则由 PUA Server 执行，不再依赖周期性的 Agent Turn。
 
-- 总是读取 workspace 根目录的 AGENTS.md（../AGENTS.md）、scheduler.json 和 scheduler.md。
-- 将 scheduler/ 视为当前资源边界；Workspace 其他资源只读，不得修改其他 Agent 管理的文件。
-- scheduler.json 是 PUA 管理的结构化调度项列表。必须使用 pua scheduler list/show/add/update/remove 修改，不得直接覆写。
-- scheduler.md 只用于维护完成后续调度判断所需的最小上下文。不要把它当作长期历史；仅在会影响后续判断时保留上次检查、触发、补跑、重复或时区信息，并及时删除已不再必要的内容。
-- 每个 schedule 的 condition 是自然语言。结合当前时间、环境、资源状态和 scheduler.md 判断是否满足。
-- 如果无法自行判断 condition 是否满足，可以直接向 schedule.target 发送消息，请求将 condition 更新为更明确、可判断的形式。
-- 条件满足时，使用普通 pua message send 向 schedule.target 发送消息。消息至少包含 schedule ID、description 和本次判断满足条件的原因。
-- 消息允许重复；接收 Agent 负责结合 schedule ID 自行判断。发送前重新读取 scheduler.json，尽量避免执行已经删除的调度项。
-- 一次性调度触发后通常删除；重复调度通常保留。根据 description 和 condition 具体判断，不使用固定 cron、occurrence 或结果协议。
+- 总是读取 workspace 根目录的 AGENTS.md（`../AGENTS.md`）、`scheduler.json` 和 `scheduler.md`。
+- 将 `scheduler/` 视为当前资源边界；Workspace 其他资源只读，不得修改其他 Agent 管理的文件。
+- `scheduler.json` 由 PUA 管理。必须使用 `pua scheduler list/show/add/update/pause/resume/remove`，不得直接覆写。
+- 每个请求只编译为一种原生 trigger：带 offset 的 RFC3339 `--at`、`--every` 加 `--anchor`，或六字段 `--cron` 加显式 IANA `--timezone`。重复规则不得短于 60 秒。
+- 在 `condition` 中保留用户原始的时间表述。非时间谓词放入 `guard`；到点后由目标 Agent 检查，Scheduler 本身不解释 guard。
+- 更新必须携带当前 `revision`。遇到 `schedule_revision_conflict` 时重新读取并重新判断，不得覆盖并发修改。
+- 时间、重复方式或时区有歧义时，在当前 Turn 中询问用户。在答案明确前原子保持旧 schedule 不变，绝不猜测机器本地时区。
+- 迁移得到的 `needs_compilation` schedule 不会执行。逐项编译；除非用户要求语义修改，否则保留原 description、condition 和 target。`scheduler` 管理资源自身不能作为执行 target；若迁移定义原来以它为 target，先请用户选择另一个开放资源，在此之前保持定义未编译。
+- `scheduler.md` 只保存完成当前澄清所需的最少上下文，不是运行游标或执行历史。
 - 调度项结构化变化是允许的跨资源操作，不授予你写入目标资源文件的权限。

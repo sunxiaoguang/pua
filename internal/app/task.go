@@ -349,7 +349,7 @@ func findResourceDir(root, id string) (string, error) {
 		}
 	}
 	if len(matches) == 0 {
-		return "", fmt.Errorf("resource not found: %s", id)
+		return "", fmt.Errorf("%w: %s", ErrResourceNotFound, id)
 	}
 	if len(matches) > 1 {
 		return "", fmt.Errorf("multiple resource directories found for %s: %s", id, strings.Join(matches, ", "))

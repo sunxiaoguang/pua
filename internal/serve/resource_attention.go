@@ -424,10 +424,6 @@ func (s *server) handleResourceRead(w http.ResponseWriter, r *http.Request, work
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	if err := validateAttentionResource(workspace.Path, resourceID); err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
 	var body struct {
 		ThroughTurnNumber *int `json:"throughTurnNumber"`
 	}
@@ -444,22 +440,30 @@ func (s *server) handleResourceRead(w http.ResponseWriter, r *http.Request, work
 		writeError(w, errors.New("throughTurnNumber must not be negative"), http.StatusBadRequest)
 		return
 	}
-	currentTurnNumber, err := s.currentCompletedResourceTurnNumber(workspace.Path, resourceID)
-	if err != nil {
-		writeError(w, err, http.StatusInternalServerError)
-		return
-	}
-	if *body.ThroughTurnNumber > currentTurnNumber {
-		writeError(w, fmt.Errorf("throughTurnNumber %d exceeds current completed Turn %d", *body.ThroughTurnNumber, currentTurnNumber), http.StatusBadRequest)
-		return
-	}
-	resourceState, err := s.mutateResourceUserStateAtPath(workspace.Path, resourceID, func(state *resourceUserState) {
-		if state.ReadTurnNumber == nil || *state.ReadTurnNumber < *body.ThroughTurnNumber {
-			state.ReadTurnNumber = cloneIntPointer(body.ThroughTurnNumber)
+	var resourceState resourceUserState
+	errorStatus := http.StatusInternalServerError
+	err = s.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+		if validateErr := validateAttentionResource(current.Path, resourceID); validateErr != nil {
+			errorStatus = http.StatusBadRequest
+			return validateErr
 		}
-	}, userName)
+		currentTurnNumber, currentErr := s.currentCompletedResourceTurnNumber(current.Path, resourceID)
+		if currentErr != nil {
+			return currentErr
+		}
+		if *body.ThroughTurnNumber > currentTurnNumber {
+			errorStatus = http.StatusBadRequest
+			return fmt.Errorf("throughTurnNumber %d exceeds current completed Turn %d", *body.ThroughTurnNumber, currentTurnNumber)
+		}
+		resourceState, currentErr = s.mutateResourceUserStateAtPath(current.Path, resourceID, func(state *resourceUserState) {
+			if state.ReadTurnNumber == nil || *state.ReadTurnNumber < *body.ThroughTurnNumber {
+				state.ReadTurnNumber = cloneIntPointer(body.ThroughTurnNumber)
+			}
+		}, userName)
+		return currentErr
+	})
 	if err != nil {
-		writeError(w, err, http.StatusInternalServerError)
+		writeError(w, err, errorStatus)
 		return
 	}
 	writeJSON(w, resourceUserStateSnapshotForState(resourceState))

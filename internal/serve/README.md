@@ -35,7 +35,29 @@ PUA_SERVE_CONFIG    serve configuration file path
 
 项目、任务、日志、归档、文件预览、Wiki、diff 和模板路由都以显式 Workspace ID 为作用域。结构化模板由 `internal/app` 校验和渲染；`POST .../tasks/preview` 返回最终标题、Markdown 和模板来源/digest，创建时可提交 `expectedTemplateDigest` 防止预览后模板发生变化。
 
-Scheduler API 同样委托 `internal/app`，提供 `GET/POST .../scheduler`、`PUT/DELETE .../scheduler/{scheduleId}` 与 `PUT .../scheduler/settings`。Server 不解析自然语言 condition；Web 界面使用这些接口维护调度项、独立绑定和唤醒间隔。
+The owner Server exposes the Scheduler API at these Workspace-scoped paths:
+
+```text
+GET    /api/workspaces/{workspaceId}/scheduler
+POST   /api/workspaces/{workspaceId}/scheduler
+POST   /api/workspaces/{workspaceId}/scheduler/changes
+PUT    /api/workspaces/{workspaceId}/scheduler/{scheduleId}
+DELETE /api/workspaces/{workspaceId}/scheduler/{scheduleId}
+POST   /api/workspaces/{workspaceId}/scheduler/{scheduleId}/pause
+POST   /api/workspaces/{workspaceId}/scheduler/{scheduleId}/resume
+```
+
+`GET .../scheduler` returns the portable definitions combined with the
+`NativeScheduler` runtime projection, including effective state, next run, and
+the latest occurrence outcome. `POST .../scheduler/changes` is the structured
+mutation boundary for create and revision-checked update operations; direct
+pause, resume, and remove routes are also serialized by the owner Server. Web
+create and edit forms do not mutate definitions directly: `POST .../scheduler`
+and `PUT .../scheduler/{scheduleId}` enqueue ordinary user messages for the
+Scheduler resource, whose Agent compiles the natural-language request and asks
+for clarification before changing an ambiguous definition. There is no
+Scheduler settings or wake-interval endpoint; scheduling deadlines come from
+the structured rules and persisted runtime checkpoint.
 
 ## Resource generation and AgentHub facts
 
@@ -120,13 +142,13 @@ curl -sS http://127.0.0.1:4936/api/workspaces/WORKSPACE_ID/messages/MESSAGE_ID
 curl -sS -X POST http://127.0.0.1:4936/api/workspaces/WORKSPACE_ID/messages/MESSAGE_ID/steer
 ```
 
-资源绑定的显式修改仍按资源收敛；Profile 映射修改只保存配置，不遍历资源、不预写 replacement。mailbox 在每个新 Turn 真正启动前重新解析当前绑定：Agent 未变化时沿用并刷新当前 generation，Agent 变化时才开始 Stop、确认 stopped、Archive 和按需创建新 generation。活动 Turn 的 steer 不开启新 Turn，继续使用当前 generation 的 Agent；enqueue、interrupt 后的新 Turn、Scheduler tick 和跨资源通知都走同一 mailbox 边界。删除仍被引用的自定义 Profile 不会改写资源显式绑定；解析按资源类型默认、再按全局 `default` 回退，同时在 generation 暴露 `agentConfigError` 和实际 `resolvedProfile`。
+资源绑定的显式修改仍按资源收敛；Profile 映射修改只保存配置，不遍历资源、不预写 replacement。mailbox 在每个新 Turn 真正启动前重新解析当前绑定：Agent 未变化时沿用并刷新当前 generation，Agent 变化时才开始 Stop、确认 stopped、Archive 和按需创建新 generation。活动 Turn 的 steer 不开启新 Turn，继续使用当前 generation 的 Agent；enqueue、interrupt 后的新 Turn、Scheduler occurrence 和跨资源通知都走同一 mailbox 边界。删除仍被引用的自定义 Profile 不会改写资源显式绑定；解析按资源类型默认、再按全局 `default` 回退，同时在 generation 暴露 `agentConfigError` 和实际 `resolvedProfile`。
 
 PUA 定期从 AgentHub 拉取 Session 状态并以同一 desired-state reconciler 更新 durable generation 记录和已存在的 runtime；轮询不再扫描全部资源以重算 Profile 绑定。Task 或 Project 归档首先以一个可恢复的顶层目录移动提交事实；它不因活动 Turn、queued/hot mailbox 或 Stop/Archive 的未知失败而阻断。Project 子树中的所有 generation 随后由 resource planner/reconciler 异步执行 Stop、确认 `stopped`、Archive；未知响应、服务重启和中间状态均由持久事实与重复 reconcile 恢复。
 
 Task 工作流状态在 mailbox 只接受未投递时不切换；资源控制器只在真实投递边界将 Task 设为 `in_progress`，并在新工作链中消费上一 Turn 的终止标记。Turn 终止收口只在没有更新 queued 消息或活动 Turn 时生成自动续推；`in_progress` 会获得继续推进提醒，`waiting` 则要求 `scheduler.json` 至少有一条 target 精确指向当前 Task 的调度项，否则生成注册唤醒 condition 的系统提醒。两类收口共用持久化 marker、确定性消息 ID 和最多 3 次的工作链恢复预算。
 
-同一周期 reconciler 还读取每个 Workspace 的 `scheduler.json` 并生成稳定、enqueue-only 的 `scheduler_tick` mailbox 消息；该消息显式以 `requestedMode=enqueue`、`actualMode=enqueue`、`ModeFrozen=true` 接受，不能被生成消息公共 helper 改成 `steer`。空列表不会生成消息；配置变化在 Scheduler 忙碌时最多保留一个 waiting tick。间隔基准只接受由 Server tick 触发且 canonical 状态为 `completed` 的 Turn 结束时间，普通用户 Turn 不会重置计时；失败 tick 和无法恢复历史的 tick 使用恢复原因重新唤醒。资源级 `scheduler.json` checkpoint 保留最近 tick 的稳定 ID、generation/Session/Turn、配置 digest 和 delivery/Turn terminal 边界，即使 tick receipt 已 compact，Server 重启也不会重复或丢失恢复判断。
+同一 reconciler 运行 `NativeScheduler`：`Snapshot` 合并便携定义和 runtime checkpoint，`Change` 串行执行结构化 CAS mutation，`Reconcile(now)` 恢复冻结 occurrence、处理到期项并返回精确 deadline。每个 schedule 的 cursor、结果、退避和 immutable `preparedOccurrence` 保存在 Scheduler 资源级 runtime `scheduler.json`，不频繁改写便携定义。到期消息使用稳定 ID 和 enqueue-only 目标 mailbox；mailbox 接受后先提交 checkpoint，再唤醒目标 controller。重复任务在目标 controller 内发现 active Turn 或 hot mailbox 时记录 `skipped_target_busy`，一次性任务仍排队。Server 重启后的重复漏跑合并一次，目标归档进入 `attention_required`，临时错误持久化指数退避。reconcile loop 的动态 timer 使用所有 Workspace 最早的 `nextRunAt/retryAt`；30 秒周期只做恢复审计。v1 项迁移为 inert `needs_compilation`，旧 queued `scheduler_tick` 会被取消，配置 digest 变化时只生成一个去重的编译消息。
 
 资源 generation 的创建、AgentHub 绑定和生命周期由资源级 API 与 reconciler 负责；不再存在独立的 PUA Session store 或写入 API。资源级 Session Lock 已删除；资源聊天由单一当前代际串行化，Web 界面不再提供 Session 新建、切换、恢复或关闭控件。内部 lifecycle controller 仍保留 AgentHub Session 的 Stop/Resume effect；这不是用户级 Session API，也不建立旁路恢复状态机。
 

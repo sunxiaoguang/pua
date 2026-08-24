@@ -35,6 +35,7 @@ const components = [
   "PaneResizeHandle",
   "ProfilesSettingsPanel",
   "ProjectTree",
+  "SchedulerPanel",
   "SettingsModal",
   "SettingsNavigation",
   "StatusPresentation",
@@ -81,6 +82,7 @@ const owners: Record<(typeof components)[number], string> = {
   PaneResizeHandle: "pane-resize-handle",
   ProfilesSettingsPanel: "profiles-settings-panel",
   ProjectTree: "project-tree",
+  SchedulerPanel: "scheduler-panel",
   SettingsModal: "settings",
   SettingsNavigation: "settings-navigation",
   StatusPresentation: "status-presentation",
@@ -575,8 +577,6 @@ describe("CSS ownership", () => {
 
     const selectors = [
       ':where([data-component-owner="resource-settings-panel"]) .resource-settings-scheduler-agent .agent-binding-button',
-      ':where([data-component-owner="resource-settings-panel"]) .resource-settings-interval input',
-      ':where([data-component-owner="resource-settings-panel"]) .resource-settings-interval .secondary-button',
     ];
     for (const selector of selectors) {
       const start = css.indexOf(selector, mobileStart);

@@ -954,7 +954,8 @@ func TestResourceServerAPIListsAndSteersWaitingMessageInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	if status.SessionState != "working" || !status.CanSteerWaiting || status.Messages.Waiting != 1 || len(status.WaitingMessages) != 1 ||
-		status.WaitingMessages[0].MessageID != waiting.ID || status.WaitingMessages[0].Text != "move this now" || status.WaitingMessages[0].Status != "waiting" {
+		status.WaitingMessages[0].MessageID != waiting.ID || status.WaitingMessages[0].Text != "move this now" || status.WaitingMessages[0].Status != "waiting" ||
+		!status.WaitingMessages[0].CanPromote {
 		t.Fatalf("waiting projection mismatch: %#v", status)
 	}
 
@@ -970,6 +971,191 @@ func TestResourceServerAPIListsAndSteersWaitingMessageInPlace(t *testing.T) {
 	if promoted.MessageID != waiting.ID || promoted.RequestedMode != resourceMessageModeEnqueue || promoted.ActualMode != resourceMessageModeSteer ||
 		promoted.Status != resourceMessageDelivered || promoted.PromotedAt == "" {
 		t.Fatalf("promoted response mismatch: %#v", promoted)
+	}
+}
+
+func TestResourceServerAPIPromotionPolicySurvivesFixedBaseMessages(t *testing.T) {
+	fake := newRuntimeFakeAgentHub()
+	fake.enforceMessageIDs = true
+	hub := httptest.NewServer(fake)
+	defer hub.Close()
+	manager, workspace, _ := newRuntimeTestManager(t, hub.URL)
+
+	_ = acceptTestResourceMessage(t, manager, workspace, "project1.task1", "start", resourceMessageModeSteer, nil)
+	record, found, err := currentResourceGeneration(workspace.Path, "project1.task1")
+	if err != nil || !found {
+		t.Fatalf("generation missing: found=%v err=%v", found, err)
+	}
+	fake.mu.Lock()
+	session := fake.sessions[record.AgentHubSessionID]
+	session.State = "running"
+	session.CurrentTurnID = "turn-active"
+	session.InputCapabilities.Steer = true
+	fake.sessions[session.ID] = session
+	fake.mu.Unlock()
+
+	legacyOrdinary := acceptTestResourceMessage(t, manager, workspace, "project1.task1", "legacy ordinary waiting", resourceMessageModeEnqueue, nil)
+	legacyOrdinary, err = updateMailboxMessage(workspace.Path, legacyOrdinary.ID, func(message *resourceMailboxMessage) {
+		// The fixed base persisted ordinary enqueues as mode-frozen while they
+		// waited behind an active Turn. The new field is deliberately omitted.
+		message.ModeFrozen = true
+		message.NonPromotable = false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary := acceptTestResourceMessage(t, manager, workspace, "project1.task1", "new ordinary waiting", resourceMessageModeEnqueue, nil)
+	frozen, err := acceptGeneratedMailboxMessage(workspace.Path, resourceMailboxMessage{
+		ID: "msg-frozen-occurrence", ResourceID: "project1.task1", Text: "run the one-time occurrence",
+		RequestedMode: resourceMessageModeEnqueue, ActualMode: resourceMessageModeEnqueue, ModeFrozen: true,
+		Type: resourceMessageTypeScheduleOccurrence, SenderWorkspaceInstanceID: "workspace-instance",
+		Causation: &resourceMessageCausation{
+			Type: resourceMessageTypeScheduleOccurrence, SourceWorkspaceInstanceID: "workspace-instance",
+			SourceResourceID: app.SchedulerResourceID, ScheduleID: "schedule-once", ScheduleRevision: 1,
+			OccurrenceID: "occurrence-once", ScheduledFor: "2026-08-01T00:00:00Z",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated := []resourceMailboxMessage{frozen}
+	for _, fixture := range []struct {
+		id, messageType string
+	}{
+		{id: "msg-fixed-base-migration", messageType: resourceMessageTypeScheduleMigration},
+		{id: "msg-fixed-base-generated", messageType: resourceMessageTypeTurnStallRecovery},
+	} {
+		accepted, acceptErr := acceptGeneratedMailboxMessage(workspace.Path, resourceMailboxMessage{
+			ID: fixture.id, ResourceID: "project1.task1", Text: "fixed-base generated message",
+			RequestedMode: resourceMessageModeEnqueue, ActualMode: resourceMessageModeEnqueue, ModeFrozen: true,
+			Type: fixture.messageType, SenderWorkspaceInstanceID: "workspace-instance",
+			Causation: &resourceMessageCausation{
+				Type: fixture.messageType, SourceWorkspaceInstanceID: "workspace-instance", SourceResourceID: app.SchedulerResourceID,
+			},
+		})
+		if acceptErr != nil {
+			t.Fatal(acceptErr)
+		}
+		// Simulate the exact fixed-base JSON omission and prove the loader's
+		// origin classifier restores the generated-message policy.
+		if _, updateErr := updateMailboxMessage(workspace.Path, accepted.ID, func(message *resourceMailboxMessage) {
+			message.NonPromotable = false
+		}); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		loaded, found, loadErr := mailboxMessageByID(workspace.Path, accepted.ID)
+		if loadErr != nil || !found || !loaded.NonPromotable {
+			t.Fatalf("fixed-base generated message did not normalize: found=%v err=%v message=%#v", found, loadErr, loaded)
+		}
+		generated = append(generated, loaded)
+	}
+	if legacyOrdinary.Status != resourceMessageQueued || !legacyOrdinary.ModeFrozen || legacyOrdinary.NonPromotable ||
+		ordinary.Status != resourceMessageQueued || ordinary.ModeFrozen || ordinary.NonPromotable || frozen.Status != resourceMessageQueued ||
+		!frozen.ModeFrozen || !frozen.NonPromotable || frozen.ActualMode != resourceMessageModeEnqueue || frozen.Sequence <= ordinary.Sequence {
+		t.Fatalf("waiting setup mismatch: legacy=%#v ordinary=%#v frozen=%#v", legacyOrdinary, ordinary, frozen)
+	}
+
+	manager.waitBackground()
+	restarted := newAgentManager(manager.server)
+	manager.server.agents = restarted
+	beforeMailbox, err := loadHotResourceMailbox(workspace.Path, "project1.task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusRecorder := httptest.NewRecorder()
+	restarted.server.handleWorkspace(statusRecorder, httptest.NewRequest(http.MethodGet,
+		"/api/workspaces/"+workspace.ID+"/resources/project1.task1/status", nil))
+	var status resourceStatusResponse
+	if err := json.Unmarshal(statusRecorder.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	canPromote := make(map[string]bool, len(status.WaitingMessages))
+	for _, waiting := range status.WaitingMessages {
+		canPromote[waiting.MessageID] = waiting.CanPromote
+	}
+	if statusRecorder.Code != http.StatusOK || !status.CanSteerWaiting || !canPromote[legacyOrdinary.ID] || !canPromote[ordinary.ID] {
+		t.Fatalf("ordinary promotion projection mismatch: code=%d status=%#v", statusRecorder.Code, status)
+	}
+	fake.mu.Lock()
+	beforeInputs := len(fake.messageIDs)
+	beforeSession := fake.sessions[record.AgentHubSessionID]
+	beforeSessionReads := fake.getSessionCalls
+	fake.mu.Unlock()
+	for _, message := range generated {
+		if canPromote[message.ID] {
+			t.Fatalf("generated message %s was projected as promotable: %#v", message.ID, status)
+		}
+		rejected := httptest.NewRecorder()
+		restarted.server.handleWorkspace(rejected, httptest.NewRequest(http.MethodPost,
+			"/api/workspaces/"+workspace.ID+"/messages/"+message.ID+"/steer", nil))
+		var rejection map[string]any
+		if err := json.Unmarshal(rejected.Body.Bytes(), &rejection); err != nil {
+			t.Fatal(err)
+		}
+		if rejected.Code != http.StatusConflict || rejection["code"] != "message_not_promotable" {
+			t.Fatalf("generated promotion response = %d %#v", rejected.Code, rejection)
+		}
+	}
+	afterMailbox, err := loadHotResourceMailbox(workspace.Path, "project1.task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(afterMailbox, beforeMailbox) {
+		t.Fatalf("rejected promotion mutated mailbox:\nbefore=%#v\nafter=%#v", beforeMailbox, afterMailbox)
+	}
+	fake.mu.Lock()
+	afterInputs := len(fake.messageIDs)
+	afterSession := fake.sessions[record.AgentHubSessionID]
+	afterSessionReads := fake.getSessionCalls
+	fake.mu.Unlock()
+	if afterInputs != beforeInputs || afterSessionReads != beforeSessionReads || !reflect.DeepEqual(afterSession, beforeSession) {
+		t.Fatalf("rejected promotion contacted the active Turn: inputs=%d/%d reads=%d/%d session=%#v/%#v",
+			afterInputs, beforeInputs, afterSessionReads, beforeSessionReads, afterSession, beforeSession)
+	}
+
+	for _, message := range []resourceMailboxMessage{legacyOrdinary, ordinary} {
+		promoted := httptest.NewRecorder()
+		restarted.server.handleWorkspace(promoted, httptest.NewRequest(http.MethodPost,
+			"/api/workspaces/"+workspace.ID+"/messages/"+message.ID+"/steer", nil))
+		if promoted.Code != http.StatusOK {
+			t.Fatalf("ordinary promotion failed: %d %s", promoted.Code, promoted.Body.String())
+		}
+		var ordinaryResponse resourceMessageResponse
+		if err := json.Unmarshal(promoted.Body.Bytes(), &ordinaryResponse); err != nil {
+			t.Fatal(err)
+		}
+		if ordinaryResponse.MessageID != message.ID || ordinaryResponse.ActualMode != resourceMessageModeSteer ||
+			ordinaryResponse.Status != resourceMessageDelivered || ordinaryResponse.PromotedAt == "" || ordinaryResponse.CanPromote {
+			t.Fatalf("ordinary promotion response mismatch: %#v", ordinaryResponse)
+		}
+	}
+	stillFrozen, found, err := mailboxMessageByID(workspace.Path, frozen.ID)
+	if err != nil || !found || stillFrozen.Status != resourceMessageQueued || !stillFrozen.ModeFrozen ||
+		stillFrozen.ActualMode != resourceMessageModeEnqueue || stillFrozen.Sequence != frozen.Sequence || stillFrozen.PromotedAt != "" {
+		t.Fatalf("ordinary promotion changed frozen occurrence: found=%v err=%v message=%#v", found, err, stillFrozen)
+	}
+
+	fake.mu.Lock()
+	session = fake.sessions[record.AgentHubSessionID]
+	session.State = "ready"
+	session.CurrentTurnID = ""
+	fake.sessions[session.ID] = session
+	fake.mu.Unlock()
+	if err := restarted.withResourceController(context.Background(), workspace, "project1.task1", func() error {
+		return restarted.reconcileResourceMailboxLocked(context.Background(), workspace, "project1.task1")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	delivered, found, err := mailboxMessageByID(workspace.Path, frozen.ID)
+	if err != nil || !found || delivered.Status != resourceMessageDelivered || !delivered.ModeFrozen ||
+		delivered.ActualMode != resourceMessageModeEnqueue || delivered.Sequence != frozen.Sequence || delivered.PromotedAt != "" {
+		t.Fatalf("ready-boundary occurrence delivery mismatch: found=%v err=%v message=%#v", found, err, delivered)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.messageIDs) != beforeInputs+3 || fake.messageIDs[len(fake.messageIDs)-1] != frozen.ID ||
+		fake.messageSteers[len(fake.messageSteers)-1] {
+		t.Fatalf("delivery modes after promotions = ids=%#v steers=%#v", fake.messageIDs, fake.messageSteers)
 	}
 }
 

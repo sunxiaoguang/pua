@@ -28,32 +28,12 @@ func (s *server) saveResourceMarkdownFile(w http.ResponseWriter, r *http.Request
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	resource, err := puaWorkspace.ResourceValue(resourceID)
-	if err != nil {
-		writeError(w, err, http.StatusNotFound)
-		return
-	}
-	if resource.Archived {
-		writeError(w, errors.New("archived resources cannot be edited"), http.StatusBadRequest)
-		return
-	}
 
 	relPath := filepath.ToSlash(filepath.Clean(strings.TrimSpace(r.URL.Query().Get("path"))))
 	if relPath == "." || relPath == "" {
 		writeError(w, errors.New("path is required"), http.StatusBadRequest)
 		return
 	}
-	abs, err := editableResourceMarkdownPath(workspace.Path, resource, relPath)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-
 	var body struct {
 		Content             string `json:"content"`
 		ExpectedContentHash string `json:"expectedContentHash"`
@@ -83,12 +63,37 @@ func (s *server) saveResourceMarkdownFile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := replaceMarkdownFile(abs, content, body.ExpectedContentHash); err != nil {
-		if errors.Is(err, errMarkdownContentConflict) {
-			writeError(w, errors.New("Markdown file changed on disk; reconcile the preserved browser draft before saving"), http.StatusConflict)
-			return
+	var abs string
+	errorStatus := http.StatusBadRequest
+	err = s.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
 		}
-		writeError(w, err, http.StatusInternalServerError)
+		resource, resourceErr := puaWorkspace.ResourceValue(resourceID)
+		if resourceErr != nil {
+			errorStatus = http.StatusNotFound
+			return resourceErr
+		}
+		if resource.Archived {
+			return errors.New("archived resources cannot be edited")
+		}
+		abs, resourceErr = editableResourceMarkdownPath(current.Path, resource, relPath)
+		if resourceErr != nil {
+			return resourceErr
+		}
+		if resourceErr = replaceMarkdownFile(abs, content, body.ExpectedContentHash); resourceErr != nil {
+			if errors.Is(resourceErr, errMarkdownContentConflict) {
+				errorStatus = http.StatusConflict
+				return errors.New("Markdown file changed on disk; reconcile the preserved browser draft before saving")
+			}
+			errorStatus = http.StatusInternalServerError
+			return resourceErr
+		}
+		return nil
+	})
+	if err != nil {
+		writeError(w, err, errorStatus)
 		return
 	}
 	previewPath(w, relPath, abs)

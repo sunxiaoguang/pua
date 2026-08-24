@@ -97,39 +97,6 @@
   font-style: italic;
 }
 
-.resource-settings-interval {
-  align-items: flex-start;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.resource-settings-interval label {
-  align-items: center;
-  display: flex;
-  gap: 6px;
-}
-
-.resource-settings-interval input {
-  background: var(--surface, var(--panel));
-  border: 1px solid var(--border-subtle, var(--line-strong));
-  border-radius: 7px;
-  color: inherit;
-  font: inherit;
-  padding: 8px 9px;
-  width: 92px;
-}
-
-.resource-settings-interval input[aria-invalid="true"] {
-  border-color: var(--danger, var(--accent-deep));
-}
-
-.resource-settings-field-error {
-  color: var(--danger, var(--accent-deep));
-  flex-basis: 100%;
-  font-size: 12px;
-}
-
 .resource-settings-policy-toggle {
   cursor: pointer;
 }
@@ -239,9 +206,7 @@
     min-height: 44px;
   }
 
-  :where([data-component-owner="resource-settings-panel"]) .resource-settings-scheduler-agent .agent-binding-button,
-  :where([data-component-owner="resource-settings-panel"]) .resource-settings-interval input,
-  :where([data-component-owner="resource-settings-panel"]) .resource-settings-interval .secondary-button {
+  :where([data-component-owner="resource-settings-panel"]) .resource-settings-scheduler-agent .agent-binding-button {
     min-height: 44px;
   }
 

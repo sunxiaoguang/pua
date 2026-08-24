@@ -47,6 +47,7 @@ export interface WaitingMessage {
   acceptedAt: string;
   requestedMode: string;
   actualMode: string;
+  canPromote: boolean;
 }
 
 export interface ResourceMessageStatus {

@@ -3,6 +3,7 @@ package serve
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,7 +185,7 @@ func TestHotMailboxMarkerDropsSettledAgentMessages(t *testing.T) {
 	}
 }
 
-func TestHotMailboxKeepsOnlyLatestUnfinishedSchedulerTick(t *testing.T) {
+func TestHotMailboxCompactsDeliveredLegacySchedulerTicks(t *testing.T) {
 	root := t.TempDir()
 	if _, err := app.Initialize(root, "en"); err != nil {
 		t.Fatal(err)
@@ -209,19 +210,14 @@ func TestHotMailboxKeepsOnlyLatestUnfinishedSchedulerTick(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hot.Messages) != 1 || hot.Messages[0].ID != "tick-3" {
-		t.Fatalf("hot scheduler messages = %#v, want only tick-3", hot.Messages)
+	if len(hot.Messages) != 0 {
+		t.Fatalf("delivered legacy Scheduler ticks remained hot: %#v", hot.Messages)
 	}
-	for _, id := range []string{"tick-1", "tick-2"} {
+	for _, id := range []string{"tick-1", "tick-2", "tick-3"} {
 		message, found, err := mailboxMessageByID(root, id)
 		if err != nil || !found || !message.receipt {
 			t.Fatalf("historical tick %s was not retained as a receipt: found=%v err=%v message=%#v", id, found, err, message)
 		}
-	}
-	if _, err := updateMailboxMessage(root, "tick-3", func(message *resourceMailboxMessage) {
-		message.TurnTerminalAt = stamp
-	}); err != nil {
-		t.Fatal(err)
 	}
 	ids, err := listHotResourceMailboxResourceIDs(root)
 	if err != nil {
@@ -229,6 +225,48 @@ func TestHotMailboxKeepsOnlyLatestUnfinishedSchedulerTick(t *testing.T) {
 	}
 	if len(ids) != 0 {
 		t.Fatalf("terminal scheduler mailbox remained active: %#v", ids)
+	}
+}
+
+func TestUnresolvedLegacySchedulerTickSurvivesReceiptCompaction(t *testing.T) {
+	root := t.TempDir()
+	if _, err := app.Initialize(root, "en"); err != nil {
+		t.Fatal(err)
+	}
+	previousCount, previousWindow := resourceMailboxReceiptRetentionCount, resourceMailboxReceiptRetentionWindow
+	resourceMailboxReceiptRetentionCount = 1
+	resourceMailboxReceiptRetentionWindow = time.Hour
+	t.Cleanup(func() {
+		resourceMailboxReceiptRetentionCount, resourceMailboxReceiptRetentionWindow = previousCount, previousWindow
+	})
+	old := time.Now().UTC().Add(-8 * 24 * time.Hour).Format(time.RFC3339Nano)
+	_, err := mutateResourceMailboxForResource(root, app.SchedulerResourceID, func(mailbox *resourceMailbox) error {
+		mailbox.Messages = append(mailbox.Messages,
+			resourceMailboxMessage{
+				ID: "tick-unresolved", Sequence: 1, ResourceID: app.SchedulerResourceID,
+				Type: resourceMessageTypeSchedulerTick, Status: resourceMessageDelivered,
+				AcceptedAt: old, UpdatedAt: old, DeliveredAt: old, TerminalAt: old,
+				GenerationID: "generation-unresolved", AgentHubSessionID: "session-unresolved", TurnID: "turn-unresolved",
+			},
+			resourceMailboxMessage{
+				ID: "tick-terminal", Sequence: 2, ResourceID: app.SchedulerResourceID,
+				Type: resourceMessageTypeSchedulerTick, Status: resourceMessageDelivered,
+				AcceptedAt: old, UpdatedAt: old, DeliveredAt: old, TerminalAt: old, TurnTerminalAt: old,
+				GenerationID: "generation-terminal", AgentHubSessionID: "session-terminal", TurnID: "turn-terminal",
+			},
+		)
+		mailbox.NextSequence = 2
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unresolved, found, err := mailboxMessageByID(root, "tick-unresolved")
+	if err != nil || !found || !unresolved.receipt || unresolved.TurnTerminalAt != "" {
+		t.Fatalf("unresolved tick receipt = %#v, found=%v err=%v", unresolved, found, err)
+	}
+	if _, found, err := mailboxMessageByID(root, "tick-terminal"); err == nil || found || !strings.Contains(err.Error(), "receipt expired") {
+		t.Fatalf("terminal tick retention = found=%v err=%v", found, err)
 	}
 }
 

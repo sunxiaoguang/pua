@@ -127,9 +127,10 @@ type generationRecord struct {
 	CompletionPending       bool   `json:"completionPending,omitempty"`
 	// Task workflow continuation fields make terminal handling idempotent across
 	// duplicate AgentHub observations and PUA Server restarts.
-	TaskStateChainID           string `json:"taskStateChainId,omitempty"`
-	TaskStateContinuationCount int    `json:"taskStateContinuationCount,omitempty"`
-	TaskStateCompletionMarker  string `json:"taskStateCompletionMarker,omitempty"`
+	TaskStateChainID           string             `json:"taskStateChainId,omitempty"`
+	TaskStateChainKind         taskStateChainKind `json:"taskStateChainKind,omitempty"`
+	TaskStateContinuationCount int                `json:"taskStateContinuationCount,omitempty"`
+	TaskStateCompletionMarker  string             `json:"taskStateCompletionMarker,omitempty"`
 	// Retired is a storage projection flag, not a public runtime field.
 	// Retired records are immutable history and must never enter the
 	// lifecycle reconciler.
@@ -207,10 +208,11 @@ type agentManager struct {
 	mu                    sync.Mutex
 	backgroundWork        sync.WaitGroup
 	resourceControllersMu sync.Mutex
-	resourceControllers   map[string]*resourceController
+	resourceControllers   map[resourceControllerKey]*resourceController
+	workspaceBarriersMu   sync.Mutex
+	workspaceBarriers     map[string]*workspaceHandoffBarrier
 	runtimes              map[string]*agentRuntime
 	subscribers           map[string]map[chan agentStreamMessage]bool
-	schedulerDigests      map[string]string
 	reconcileWake         chan struct{}
 	reconcilePending      reconcileRequest
 	now                   func() time.Time
@@ -245,10 +247,10 @@ func (m *agentManager) waitBackground() {
 func newAgentManager(s *server) *agentManager {
 	return &agentManager{
 		server:               s,
-		resourceControllers:  make(map[string]*resourceController),
+		resourceControllers:  make(map[resourceControllerKey]*resourceController),
+		workspaceBarriers:    make(map[string]*workspaceHandoffBarrier),
 		runtimes:             make(map[string]*agentRuntime),
 		subscribers:          make(map[string]map[chan agentStreamMessage]bool),
-		schedulerDigests:     make(map[string]string),
 		reconcileWake:        make(chan struct{}, 1),
 		now:                  time.Now,
 		idleSleepAfter:       defaultResourceIdleSleepAfter,

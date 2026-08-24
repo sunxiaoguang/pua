@@ -21,6 +21,23 @@ type resolvedResourceAgent struct {
 	InstanceID      string
 }
 
+type resourceAgentBindingUnavailableError struct {
+	cause error
+}
+
+func (e *resourceAgentBindingUnavailableError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *resourceAgentBindingUnavailableError) Unwrap() error {
+	return e.cause
+}
+
+func isResourceAgentBindingUnavailable(err error) bool {
+	var unavailable *resourceAgentBindingUnavailableError
+	return errors.As(err, &unavailable)
+}
+
 func generationSourceInstanceID(cfg config, record generationRecord) string {
 	if value := strings.TrimSpace(record.SourceInstanceID); value != "" {
 		return value
@@ -73,6 +90,9 @@ func (m *agentManager) resolveResourceAgent(workspace serveWorkspace, resourceID
 	}
 	binding, err := puaWorkspace.ResourceAgentBinding(resourceID)
 	if err != nil {
+		if app.IsKind(err, "binding") {
+			return resolvedResourceAgent{}, &resourceAgentBindingUnavailableError{cause: err}
+		}
 		return resolvedResourceAgent{}, err
 	}
 	resolved := resolvedResourceAgent{Binding: binding, InstanceID: runtimeConfig.InstanceID}
@@ -108,7 +128,7 @@ func (m *agentManager) resolveResourceAgent(workspace serveWorkspace, resourceID
 		digest := sha256.Sum256([]byte(requested + "\x00" + resolved.ResolvedProfile + "\x00" + resolved.AgentName + "\x00" + resolved.ConfigError))
 		resolved.ProfileRevision = hex.EncodeToString(digest[:8])
 	default:
-		return resolvedResourceAgent{}, fmt.Errorf("unsupported resource agent binding kind %q", binding.Kind)
+		return resolvedResourceAgent{}, &resourceAgentBindingUnavailableError{cause: fmt.Errorf("unsupported resource agent binding kind %q", binding.Kind)}
 	}
 	return resolved, nil
 }
@@ -147,7 +167,7 @@ func workspaceResourceDefaultForKind(runtimeConfig app.WorkspaceRuntimeConfig, k
 
 func resolvedAgentError(resolved resolvedResourceAgent, requested, fallback string) (resolvedResourceAgent, error) {
 	resolved.ConfigError = fmt.Sprintf("Agent Profile %q cannot be resolved; type default %q and global Profile \"default\" are unavailable", requested, fallback)
-	return resolved, errors.New(resolved.ConfigError + "; configure one of these Profiles before starting a new generation")
+	return resolved, &resourceAgentBindingUnavailableError{cause: errors.New(resolved.ConfigError + "; configure one of these Profiles before starting a new generation")}
 }
 
 func nextResourceGeneration(workspacePath, resourceID string) (int, error) {
@@ -316,6 +336,93 @@ func (m *agentManager) resourceBindingChanged(ctx context.Context, workspace ser
 	})
 }
 
+// updateResourceAgentBinding serializes the portable binding mutation with
+// generation reconciliation. Scheduler attention has no retry deadline, so a
+// changed binding must wake it promptly, but only after both durable mutation
+// and generation reconciliation succeed. Once the resource controller starts
+// the job, its durable boundary and wake are independent of caller
+// cancellation. requestReconcile does not acquire the Scheduler controller,
+// so performing it before this job completes cannot invert delivery locks.
+func (m *agentManager) updateResourceAgentBinding(ctx context.Context, workspace serveWorkspace, resourceID string, binding app.AgentBinding) (app.AgentBinding, bool, error) {
+	outcome := m.runResourceBindingControllerJob(ctx, workspace, resourceID, func(jobCtx context.Context) resourceBindingMutationOutcome {
+		return m.updateResourceAgentBindingLocked(jobCtx, workspace, resourceID, binding)
+	})
+	return outcome.updated, outcome.persisted, outcome.err
+}
+
+type resourceBindingMutationOutcome struct {
+	updated   app.AgentBinding
+	persisted bool
+	material  bool
+	err       error
+}
+
+// runResourceBindingControllerJob separates a request's wait lifetime from a
+// binding mutation which has already started. The buffered outcome prevents a
+// completed callback from racing result variables owned by a cancelled caller.
+func (m *agentManager) runResourceBindingControllerJob(
+	ctx context.Context,
+	workspace serveWorkspace,
+	resourceID string,
+	mutation func(context.Context) resourceBindingMutationOutcome,
+) resourceBindingMutationOutcome {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := make(chan resourceBindingMutationOutcome, 1)
+	err := m.withResourceController(ctx, workspace, resourceID, func() error {
+		outcome := resourceBindingMutationOutcome{}
+		if m.server == nil {
+			outcome.err = errors.New("resource binding owner Server is unavailable")
+		} else if _, ownershipErr := m.server.revalidateWorkspaceMutation(workspace); ownershipErr != nil {
+			outcome.err = ownershipErr
+		} else if mutation != nil {
+			outcome = mutation(context.WithoutCancel(ctx))
+		}
+		if outcome.err == nil && outcome.material && m.server.ownsWorkspace(workspace.Path) {
+			m.requestReconcile(reconcileScheduler)
+		}
+		result <- outcome
+		return outcome.err
+	})
+	if err != nil {
+		// A cancelled waiter must not race a still-running job for its result.
+		// If the job was skipped before start, result remains empty; if it was
+		// already running, its buffered outcome is intentionally left for GC.
+		if ctx.Err() != nil {
+			return resourceBindingMutationOutcome{err: err}
+		}
+		// A controller-owned mutation error is published before its callback
+		// returns. Controller lookup failures publish no outcome.
+		select {
+		case outcome := <-result:
+			return outcome
+		default:
+			return resourceBindingMutationOutcome{err: err}
+		}
+	}
+	return <-result
+}
+
+func (m *agentManager) updateResourceAgentBindingLocked(ctx context.Context, workspace serveWorkspace, resourceID string, binding app.AgentBinding) resourceBindingMutationOutcome {
+	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
+	if err != nil {
+		return resourceBindingMutationOutcome{err: err}
+	}
+	previous, previousErr := puaWorkspace.ResourceAgentBinding(resourceID)
+	updated, err := puaWorkspace.SetResourceAgentBinding(resourceID, binding)
+	if err != nil {
+		return resourceBindingMutationOutcome{err: err}
+	}
+	outcome := resourceBindingMutationOutcome{
+		updated: updated, persisted: true, material: previousErr != nil || previous != updated,
+	}
+	if err := m.resourceBindingChangedLocked(ctx, workspace, resourceID, updated); err != nil {
+		outcome.err = err
+	}
+	return outcome
+}
+
 func (m *agentManager) resourceBindingChangedLocked(ctx context.Context, workspace serveWorkspace, resourceID string, binding app.AgentBinding) error {
 	_ = binding
 	record, found, err := currentResourceGeneration(workspace.Path, resourceID)
@@ -412,6 +519,9 @@ func (m *agentManager) prepareResourceGenerationForNewTurnLocked(ctx context.Con
 	}
 	resolved, resolveErr := m.resolveResourceAgent(workspace, record.ResourceID, cfg)
 	if resolveErr != nil {
+		if !isResourceAgentBindingUnavailable(resolveErr) {
+			return false, resolveErr
+		}
 		if rt != nil {
 			_, persistErr := rt.mutateGeneration(func(current *generationRecord) {
 				current.AgentConfigError = resolved.ConfigError

@@ -34,6 +34,14 @@ func (m *agentManager) agentHubRuntimeConfig() (config, *agentHubClient, error) 
 	return cfg, client, nil
 }
 
+type agentHubGenerationAgentUnavailableError struct {
+	message string
+}
+
+func (e *agentHubGenerationAgentUnavailableError) Error() string {
+	return e.message
+}
+
 // validateAgentHubGenerationAgent runs before PUA creates a session or changes the
 // task. AgentHub may reject an unavailable configured target during session
 // creation, but validating against the catalog first prevents an unavailable
@@ -41,7 +49,7 @@ func (m *agentManager) agentHubRuntimeConfig() (config, *agentHubClient, error) 
 func validateAgentHubGenerationAgent(ctx context.Context, client *agentHubClient, requested string) (string, error) {
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
-		return "", errors.New("no AgentHub agent is configured")
+		return "", &agentHubGenerationAgentUnavailableError{message: "no AgentHub agent is configured"}
 	}
 	catalog, err := client.Agents(ctx)
 	if err != nil {
@@ -56,11 +64,11 @@ func validateAgentHubGenerationAgent(ctx context.Context, client *agentHubClient
 			if reason == "" {
 				reason = "the AgentHub agent is unavailable"
 			}
-			return "", fmt.Errorf("AgentHub agent %q is unavailable: %s", agent.Name, reason)
+			return "", &agentHubGenerationAgentUnavailableError{message: fmt.Sprintf("AgentHub agent %q is unavailable: %s", agent.Name, reason)}
 		}
 		return strings.TrimSpace(agent.Name), nil
 	}
-	return "", fmt.Errorf("AgentHub agent %q is unavailable or not present in the catalog", requested)
+	return "", &agentHubGenerationAgentUnavailableError{message: fmt.Sprintf("AgentHub agent %q is unavailable or not present in the catalog", requested)}
 }
 
 // snapshotAgentHubAgent captures the catalog facts used to launch a

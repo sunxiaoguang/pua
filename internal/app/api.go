@@ -17,6 +17,10 @@ import (
 	"github.com/disksing/pua/internal/workspacepath"
 )
 
+// ErrResourceNotFound identifies a stable missing-resource condition while
+// allowing callers to distinguish it from temporary filesystem failures.
+var ErrResourceNotFound = errors.New("resource not found")
+
 // APIError describes a failed application operation without requiring callers
 // to parse CLI output. The underlying error remains available through Unwrap.
 type APIError struct {
@@ -261,6 +265,9 @@ func (w *Workspace) migrate(language string) error {
 	}
 	if err := updateOpenTaskAgentsMD(w.root, language); err != nil {
 		return &APIError{Operation: "migrate Workspace", Kind: "workspace", Workspace: w.root, Err: err}
+	}
+	if err := migrateSchedulerJSONLocked(w.root); err != nil {
+		return &APIError{Operation: "migrate Workspace", Kind: "scheduler", Workspace: w.root, Err: err}
 	}
 	if _, err := ensureSchedulerLocked(w.root, language); err != nil {
 		return &APIError{Operation: "migrate Workspace", Kind: "scheduler", Workspace: w.root, Err: err}

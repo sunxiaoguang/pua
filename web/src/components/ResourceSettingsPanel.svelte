@@ -1,7 +1,6 @@
 <script lang="ts">
   import "./ResourceSettingsPanel.css";
 
-  import { ApiClient } from "../api/client";
   import type { ResourceAgentBindingModel } from "../models/detail";
   import AgentBindingSelector from "./AgentBindingSelector.svelte";
   import Icon from "./Icon.svelte";
@@ -10,10 +9,7 @@
 
   let { model, onOpenTemplate }: { model: DetailPanelModel; onOpenTemplate?: (path: string) => void } = $props();
 
-  const client = new ApiClient();
-
   let pending = $state("");
-  let interval = $state(30);
   let generationPolicyEnabled = $state(true);
   let generationMaxTurns = $state(20);
   let generationMaxMinutes = $state(120);
@@ -27,10 +23,6 @@
   let descInput = $state<HTMLInputElement | null>(null);
   let preferenceDrafts = $state<Record<string, string>>({});
   let newUserName = $state("");
-  $effect(() => {
-    const wake = model.detail?.scheduler?.wakeIntervalMinutes;
-    if (typeof wake === "number") interval = wake;
-  });
   $effect(() => {
     generationPolicyEnabled = model.generationPolicy.enabled;
     generationMaxTurns = model.generationPolicy.maxTurns;
@@ -47,8 +39,6 @@
     if (descEditing && descInput) descInput.focus();
   });
 
-  const schedulerConfig = $derived(model.detail?.scheduler);
-  const schedulerIntervalValid = $derived(Number.isInteger(interval) && interval >= 1 && interval <= 10080);
   const taskDefault = $derived<ResourceAgentBindingModel>(model.detail?.taskDefault?.name ? { kind: model.detail.taskDefault.kind, name: model.detail.taskDefault.name } : { kind: "profile", name: "" });
   const description = $derived(model.detail?.description || "");
 
@@ -190,18 +180,6 @@
     }
   }
 
-  function saveSchedulerInterval(): void {
-    const config = schedulerConfig;
-    if (!config || !schedulerIntervalValid) return;
-    void run("interval", async () => {
-      await client.request(`/api/workspaces/${encodeURIComponent(model.workspaceId)}/scheduler/settings`, {
-        method: "PUT",
-        body: JSON.stringify({ agentBinding: config.agentBinding, wakeIntervalMinutes: interval }),
-      });
-      await model.onRefreshScheduler?.();
-      model.onToast("Scheduler interval saved.");
-    });
-  }
 </script>
 
 <div class="resource-settings" data-component-owner="resource-settings-panel">
@@ -308,28 +286,11 @@
       </div>
       <div class="resource-settings-list">
         <div class="resource-settings-row">
-          <div class="resource-settings-row-label"><strong>Scheduler Agent</strong><span>Runs Scheduler wake-up Turns. Matches the selector in the chat composer.</span></div>
+          <div class="resource-settings-row-label"><strong>Scheduler Agent</strong><span>Compiles and manages schedule definitions. Native timing runs in the Server.</span></div>
           <AgentBindingSelector value={model.agentBinding} profiles={model.agentProfiles} agents={model.agents} disabled={Boolean(pending)} openUp={false} ariaLabel="Scheduler Agent binding" onSelect={saveOwnBinding} />
         </div>
       </div>
     </section>
-    {#if schedulerConfig}
-      <section class="resource-settings-section">
-        <div class="resource-settings-section-head">
-          <strong>Schedule</strong>
-        </div>
-        <div class="resource-settings-list">
-          <div class="resource-settings-row">
-            <div class="resource-settings-row-label"><strong>Wake interval</strong><span>Minutes after the previous Server-triggered Scheduler Turn completes. Empty schedule lists do not wake.</span></div>
-            <div class="resource-settings-interval">
-              <label><input type="number" min="1" max="10080" step="1" bind:value={interval} aria-label="Scheduler wake interval in minutes" aria-invalid={schedulerIntervalValid ? undefined : "true"} aria-describedby={schedulerIntervalValid ? undefined : "schedulerIntervalError"} /><span>minutes</span></label>
-              <button type="button" class="secondary-button" disabled={Boolean(pending) || !schedulerIntervalValid || interval === schedulerConfig.wakeIntervalMinutes} onclick={saveSchedulerInterval}><Icon name="save" /><span>Save</span></button>
-              {#if !schedulerIntervalValid}<span id="schedulerIntervalError" class="resource-settings-field-error" role="alert">Enter a whole number between 1 and 10080 minutes.</span>{/if}
-            </div>
-          </div>
-        </div>
-      </section>
-    {/if}
   {:else if model.resourceType === "project"}
     <section class="resource-settings-section">
       <div class="resource-settings-section-head">

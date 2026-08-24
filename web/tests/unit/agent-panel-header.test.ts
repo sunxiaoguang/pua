@@ -104,7 +104,7 @@ describe("AgentPanelHeader", () => {
     const { target } = mountModel(model({
       status: status({
         sessionState: "attention_required",
-        waitingMessages: [{ messageId: "m1", text: "hi", status: "waiting", acceptedAt: "", requestedMode: "enqueue", actualMode: "enqueue" }],
+        waitingMessages: [{ messageId: "m1", text: "hi", status: "waiting", acceptedAt: "", requestedMode: "enqueue", actualMode: "enqueue", canPromote: true }],
       }),
     }));
     await tick();

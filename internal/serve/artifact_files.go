@@ -23,42 +23,46 @@ func (s *server) deleteResourceArtifact(w http.ResponseWriter, r *http.Request, 
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-	if err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	resource, err := puaWorkspace.ResourceValue(resourceID)
-	if err != nil {
-		writeError(w, err, http.StatusNotFound)
-		return
-	}
-	if resource.Archived {
-		writeError(w, errors.New("archived resources cannot be edited"), http.StatusBadRequest)
-		return
-	}
 
 	relPath := filepath.ToSlash(filepath.Clean(strings.TrimSpace(r.URL.Query().Get("path"))))
 	if relPath == "." || relPath == "" {
 		writeError(w, errors.New("path is required"), http.StatusBadRequest)
 		return
 	}
-	abs, err := deletableResourceArtifactPath(workspace.Path, resource, relPath)
+	errorStatus := http.StatusBadRequest
+	err = s.withWorkspaceMutation(r.Context(), workspace, resourceID, func(current serveWorkspace) error {
+		puaWorkspace, openErr := app.OpenWorkspace(current.Path)
+		if openErr != nil {
+			return openErr
+		}
+		resource, resourceErr := puaWorkspace.ResourceValue(resourceID)
+		if resourceErr != nil {
+			errorStatus = http.StatusNotFound
+			return resourceErr
+		}
+		if resource.Archived {
+			return errors.New("archived resources cannot be edited")
+		}
+		abs, resourceErr := deletableResourceArtifactPath(current.Path, resource, relPath)
+		if resourceErr != nil {
+			if os.IsNotExist(resourceErr) {
+				errorStatus = http.StatusNotFound
+				return errors.New("artifact file does not exist")
+			}
+			return resourceErr
+		}
+		if resourceErr = os.Remove(abs); resourceErr != nil {
+			if os.IsNotExist(resourceErr) {
+				errorStatus = http.StatusNotFound
+				return errors.New("artifact file does not exist")
+			}
+			errorStatus = http.StatusInternalServerError
+			return resourceErr
+		}
+		return nil
+	})
 	if err != nil {
-		if os.IsNotExist(err) {
-			writeError(w, errors.New("artifact file does not exist"), http.StatusNotFound)
-			return
-		}
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-
-	if err := os.Remove(abs); err != nil {
-		if os.IsNotExist(err) {
-			writeError(w, errors.New("artifact file does not exist"), http.StatusNotFound)
-			return
-		}
-		writeError(w, err, http.StatusInternalServerError)
+		writeError(w, err, errorStatus)
 		return
 	}
 	writeJSON(w, struct {

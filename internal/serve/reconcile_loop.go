@@ -7,8 +7,6 @@ import (
 	"log"
 	"strings"
 	"time"
-
-	"github.com/disksing/pua/internal/app"
 )
 
 type reconcileRequest uint8
@@ -76,6 +74,15 @@ func earliestReconcileDeadline(deadlines ...time.Time) time.Time {
 	return earliest
 }
 
+func finishColdAuditRequests(request reconcileRequest, schedulerDeadline, now time.Time) (reconcileRequest, time.Time) {
+	request &^= reconcileAgentHub | reconcileMailboxes | reconcileNotifications
+	if !schedulerDeadline.IsZero() && !schedulerDeadline.After(now) {
+		request |= reconcileScheduler
+		schedulerDeadline = time.Time{}
+	}
+	return request, schedulerDeadline
+}
+
 // runReconcileLoop keeps latency-sensitive AgentHub projection separate from
 // cold filesystem audits and recovery-only mailbox/notification passes. All
 // requests are coalesced here; per-resource mutation remains serialized by the
@@ -124,10 +131,7 @@ func (m *agentManager) runReconcileLoop(ctx context.Context) {
 			nextNotifications = now.Add(durationOr(m.notificationInterval, 30*time.Second))
 			nextSchedulerFallback = now.Add(durationOr(m.schedulerFallback, 30*time.Second))
 			nextSchedulerDeadline = m.nextSchedulerReconcileDeadline(now)
-			if !nextSchedulerDeadline.After(now) {
-				nextSchedulerDeadline = time.Time{}
-			}
-			request &^= reconcileAgentHub | reconcileMailboxes | reconcileNotifications | reconcileScheduler
+			request, nextSchedulerDeadline = finishColdAuditRequests(request, nextSchedulerDeadline, now)
 		}
 		if request&reconcileAgentHub != 0 {
 			if err := m.pollFastAgentHubSessions(ctx); err != nil {
@@ -376,14 +380,14 @@ func (m *agentManager) reconcileOwnedWorkspaceNotifications(ctx context.Context)
 }
 
 func (m *agentManager) reconcileOwnedWorkspaceSchedulers(ctx context.Context) error {
-	cfg, client, err := m.agentHubRuntimeConfig()
+	cfg, err := m.server.loadConfig()
 	if err != nil {
 		return err
 	}
 	var failures []string
 	for _, workspace := range cfg.Workspaces {
 		if m.server.ownsWorkspace(workspace.Path) {
-			if err := m.reconcileSchedulerLocked(ctx, workspace, client); err != nil {
+			if err := m.reconcileSchedulerLocked(ctx, workspace); err != nil {
 				failures = append(failures, fmt.Sprintf("%s: %v", workspace.ID, err))
 			}
 		}
@@ -394,11 +398,11 @@ func (m *agentManager) reconcileOwnedWorkspaceSchedulers(ctx context.Context) er
 	return nil
 }
 
-// nextSchedulerReconcileDeadline derives an exact wake time from the durable
-// terminal checkpoint. Active Scheduler Turns are woken by completion events;
-// the fallback audit covers missed events and out-of-process config edits.
+// nextSchedulerReconcileDeadline derives the exact earliest native schedule or
+// retry deadline. The fallback audit is only for restart, manual file changes,
+// and clock-jump recovery.
 func (m *agentManager) nextSchedulerReconcileDeadline(now time.Time) time.Time {
-	cfg, _, err := m.agentHubRuntimeConfig()
+	cfg, err := m.server.loadConfig()
 	if err != nil {
 		return time.Time{}
 	}
@@ -407,23 +411,11 @@ func (m *agentManager) nextSchedulerReconcileDeadline(now time.Time) time.Time {
 		if !m.server.ownsWorkspace(workspace.Path) {
 			continue
 		}
-		puaWorkspace, err := app.OpenWorkspace(workspace.Path)
-		if err != nil {
+		snapshot, err := newNativeScheduler(m, workspace).Snapshot(now)
+		if err != nil || snapshot.NextWakeAt == "" {
 			continue
 		}
-		config, err := puaWorkspace.Scheduler()
-		if err != nil || len(config.Schedules) == 0 {
-			continue
-		}
-		store, err := loadResourceMailboxStoreForRead(workspace.Path, app.SchedulerResourceID)
-		if err != nil || strings.TrimSpace(store.Scheduler.TurnTerminalAt) == "" || strings.TrimSpace(store.Scheduler.TurnStatus) != "completed" {
-			continue
-		}
-		terminalAt := generationTime(store.Scheduler.TurnTerminalAt)
-		if terminalAt.IsZero() {
-			continue
-		}
-		deadline := terminalAt.Add(time.Duration(config.WakeIntervalMinutes) * time.Minute)
+		deadline := generationTime(snapshot.NextWakeAt)
 		if deadline.Before(now) {
 			deadline = now
 		}

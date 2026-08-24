@@ -1,0 +1,16 @@
+PUA 定时任务 occurrence {{.OccurrenceID}}。
+
+- Schedule：{{.ScheduleID}} revision {{.Revision}}
+- 计划时间：{{.ScheduledFor}}
+{{if .CronEnumerationCapped}}- Cron 枚举已达到上限：是
+- 已枚举截至：{{.EnumeratedThrough}}（精确枚举 {{.EnumeratedCount}} 个 nominal occurrence；合并总数至少为 {{.EnumeratedCount}}）
+- 恢复截点：{{.RecoveryCutoff}}（任何位于此时刻或之前的额外 nominal occurrence 也已在未枚举的情况下合并；不表示该截点本身是 nominal occurrence）
+{{else}}- 合并截至：{{.CoalescedThrough}}（{{.CoalescedCount}} 个 nominal occurrence）
+{{end}}- 下次 occurrence：{{if .HasNext}}{{.NextRunAt}}{{else}}无{{end}}
+- 原始条件：{{.Condition}}
+- 动作：{{.Action}}
+{{if .HasGuard}}- Guard：{{.Guard}}
+
+现在检查 guard。若为假，结束本 Turn，不执行动作。{{else}}- Guard：无
+{{end}}
+Mailbox 采用 at-least-once 语义。产生外部副作用前，使用 occurrence ID 做幂等去重。

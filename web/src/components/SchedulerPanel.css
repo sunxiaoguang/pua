@@ -1,89 +1,74 @@
-.scheduler-settings-card,
-.schedule-editor,
-.schedule-list article {
-  background: var(--surface-raised, var(--panel));
-  border: 1px solid var(--border-subtle, var(--line-soft));
+:where([data-component-owner="scheduler-panel"]).schedule-editor,
+:where([data-component-owner="scheduler-panel"]).schedule-list article {
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
   border-radius: 10px;
 }
 
-.scheduler-settings-card {
-  align-items: center;
-  display: flex;
-  gap: 14px;
-  margin-bottom: 16px;
-  padding: 14px;
-}
+:where([data-component-owner="scheduler-panel"]) .schedule-editor-heading > div { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
+:where([data-component-owner="scheduler-panel"]) .schedule-editor-heading span { color: var(--muted); font-size: 12px; }
 
-.scheduler-settings-card > div:first-child,
-.schedule-editor-heading > div { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
-.scheduler-settings-card span,
-.schedule-editor-heading span { color: var(--text-muted); font-size: 12px; }
-.scheduler-settings-card label { align-items: center; display: flex; gap: 6px; }
-.scheduler-settings-card input { width: 92px; }
-
-.schedule-editor { display: grid; gap: 12px; margin-bottom: 16px; padding: 14px; }
-.schedule-editor-heading { align-items: flex-start; display: flex; gap: 12px; }
-.schedule-editor label { display: grid; gap: 5px; }
-.schedule-editor label > span { color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-.schedule-field-error { color: var(--red, var(--accent-deep)); font-size: 12px; }
-.schedule-editor input[aria-invalid="true"] { border-color: var(--red, var(--accent-deep)); }
-.schedule-editor input,
-.schedule-editor textarea,
-.scheduler-settings-card input {
-  background: var(--surface, var(--panel));
-  border: 1px solid var(--border-subtle, var(--line-strong));
+:where([data-component-owner="scheduler-panel"]).schedule-editor { display: grid; gap: 12px; margin-bottom: 16px; padding: 14px; }
+:where([data-component-owner="scheduler-panel"]) .schedule-editor-heading { align-items: flex-start; display: flex; gap: 12px; }
+:where([data-component-owner="scheduler-panel"]).schedule-editor label { display: grid; gap: 5px; }
+:where([data-component-owner="scheduler-panel"]).schedule-editor label > span { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+:where([data-component-owner="scheduler-panel"]) .schedule-field-error { color: var(--red, var(--accent-deep)); font-size: 12px; }
+:where([data-component-owner="scheduler-panel"]).schedule-editor input[aria-invalid="true"] { border-color: var(--red, var(--accent-deep)); }
+:where([data-component-owner="scheduler-panel"]).schedule-editor input,
+:where([data-component-owner="scheduler-panel"]).schedule-editor textarea {
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
   border-radius: 7px;
   color: inherit;
   font: inherit;
   padding: 8px 9px;
 }
-.schedule-editor input { min-height: 44px; }
-.schedule-editor textarea { resize: vertical; }
-.schedule-editor > button { justify-self: start; }
-.schedule-editor > button {
+:where([data-component-owner="scheduler-panel"]).schedule-editor input { min-height: 44px; }
+:where([data-component-owner="scheduler-panel"]).schedule-editor textarea { resize: vertical; }
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button { justify-self: start; }
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button {
   gap: 7px;
   min-height: 44px;
 }
-.schedule-editor > button .schedule-icon {
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button .schedule-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
-.schedule-editor > button .schedule-icon-busy,
-.schedule-editor > button .schedule-icon-editing {
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button .schedule-icon-busy,
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button .schedule-icon-editing {
   display: none;
 }
-.schedule-editor > button.editing .schedule-icon-add {
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button.editing .schedule-icon-add {
   display: none;
 }
-.schedule-editor > button.editing .schedule-icon-editing {
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button.editing .schedule-icon-editing {
   display: inline-flex;
 }
-.schedule-editor > button.busy .schedule-icon-add,
-.schedule-editor > button.busy .schedule-icon-editing {
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button.busy .schedule-icon-add,
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button.busy .schedule-icon-editing {
   display: none;
 }
-.schedule-editor > button.busy .schedule-icon-busy {
+:where([data-component-owner="scheduler-panel"]).schedule-editor > button.busy .schedule-icon-busy {
   display: inline-flex;
 }
 
-.schedule-list { display: grid; gap: 10px; min-width: 0; }
-.schedule-list > * { min-width: 0; }
-.schedule-list article { padding: 13px; }
-.schedule-list article.editing { border-color: var(--accent, var(--blue)); box-shadow: 0 0 0 1px var(--accent, var(--blue)); }
-.schedule-list header { align-items: flex-start; display: flex; gap: 12px; justify-content: space-between; }
-.schedule-list header > div { align-items: flex-start; display: flex; gap: 7px; min-width: 0; }
-.schedule-list header > div:first-child { flex: 1 1 auto; }
-.schedule-list header > div:first-child { flex-direction: column; }
-.schedule-list header strong { overflow-wrap: anywhere; }
-.schedule-list code { font-size: 11px; }
-.schedule-list dl { display: grid; gap: 9px; margin: 12px 0 0; }
-.schedule-list dl > div { display: grid; gap: 2px; }
-.schedule-list dt { color: var(--text-muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
-.schedule-list dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
-.schedule-list .empty-list-row span { overflow-wrap: anywhere; white-space: normal; }
+:where([data-component-owner="scheduler-panel"]).schedule-list { display: grid; gap: 10px; min-width: 0; }
+:where([data-component-owner="scheduler-panel"]).schedule-list > * { min-width: 0; }
+:where([data-component-owner="scheduler-panel"]).schedule-list article { padding: 13px; }
+:where([data-component-owner="scheduler-panel"]).schedule-list article.editing { border-color: var(--accent, var(--blue)); box-shadow: 0 0 0 1px var(--accent, var(--blue)); }
+:where([data-component-owner="scheduler-panel"]).schedule-list header { align-items: flex-start; display: flex; gap: 12px; justify-content: space-between; }
+:where([data-component-owner="scheduler-panel"]).schedule-list header > div { align-items: flex-start; display: flex; gap: 7px; min-width: 0; }
+:where([data-component-owner="scheduler-panel"]).schedule-list header > div:first-child { flex: 1 1 auto; }
+:where([data-component-owner="scheduler-panel"]).schedule-list header > div:first-child { flex-direction: column; }
+:where([data-component-owner="scheduler-panel"]).schedule-list header strong { overflow-wrap: anywhere; }
+:where([data-component-owner="scheduler-panel"]).schedule-list code { font-size: 11px; }
+:where([data-component-owner="scheduler-panel"]).schedule-list dl { display: grid; gap: 9px; margin: 12px 0 0; }
+:where([data-component-owner="scheduler-panel"]).schedule-list dl > div { display: grid; gap: 2px; }
+:where([data-component-owner="scheduler-panel"]).schedule-list dt { color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+:where([data-component-owner="scheduler-panel"]).schedule-list dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+:where([data-component-owner="scheduler-panel"]).schedule-list .empty-list-row span { overflow-wrap: anywhere; white-space: normal; }
 
 @media (max-width: 720px) {
-  .scheduler-settings-card { align-items: stretch; flex-direction: column; }
-  .schedule-list header { flex-direction: column; }
+  :where([data-component-owner="scheduler-panel"]).schedule-list header { flex-direction: column; }
 }

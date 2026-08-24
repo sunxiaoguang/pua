@@ -30,6 +30,7 @@ type workspaceLockMetadata struct {
 
 type workspaceLock struct {
 	workspace string
+	path      string
 	file      *os.File
 }
 
@@ -97,8 +98,16 @@ func (m *workspaceLockManager) acquire(workspacePath string) (string, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.locks[canonical]; ok {
-		return canonical, nil
+	if held, ok := m.locks[canonical]; ok {
+		if held.referencesNamedFile() {
+			return canonical, nil
+		}
+		// Removing and recreating a Workspace can leave our descriptor locked
+		// on an unlinked inode while another Server owns the newly named lock
+		// file. Drop that stale claim instead of treating a later explicit add
+		// as an ownership-preserving no-op.
+		delete(m.locks, canonical)
+		_ = held.close()
 	}
 	lockDir, err := workspacepath.ResolveControlDir(canonical)
 	if err != nil {
@@ -132,13 +141,39 @@ func (m *workspaceLockManager) acquire(workspacePath string) (string, error) {
 		_ = file.Close()
 		return "", fmt.Errorf("write workspace serve lock %s: %w", lockPath, err)
 	}
-	m.locks[canonical] = &workspaceLock{workspace: canonical, file: file}
+	m.locks[canonical] = &workspaceLock{workspace: canonical, path: lockPath, file: file}
 	return canonical, nil
 }
 
 // owns reports whether this process currently holds the serve lock for the
 // Workspace containing the given path.
 func (m *workspaceLockManager) owns(workspacePath string) bool {
+	canonical, err := canonicalWorkspacePath(workspacePath)
+	if err != nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lock, ok := m.locks[canonical]
+	if !ok {
+		return false
+	}
+	if lock.referencesNamedFile() {
+		return true
+	}
+	// An advisory lock protects an inode, not a pathname. Fail closed when
+	// the pathname has been replaced. Keep the descriptor claim only so an
+	// explicit stale-Workspace removal can drain controllers and clean its
+	// serve-config entry; acquire revalidates and retires it before any reuse.
+	return false
+}
+
+// holds reports the descriptor claim used only to serialize explicit removal
+// of a persisted, unavailable Workspace. Unlike owns, it does not authorize
+// ordinary reads or writes and therefore does not require a currently named
+// lock inode. The removal path still revalidates the persisted instance before
+// changing serve configuration or releasing this descriptor.
+func (m *workspaceLockManager) holds(workspacePath string) bool {
 	canonical, err := canonicalWorkspacePath(workspacePath)
 	if err != nil {
 		return false
@@ -192,6 +227,26 @@ func (lock *workspaceLock) close() error {
 	return closeErr
 }
 
+// referencesNamedFile proves that the descriptor on which this process took
+// its advisory lock is still the file currently named by the Workspace lock
+// path. os.SameFile uses the platform's file identity rather than timestamps
+// or contents, so removing and recreating either the Workspace or serve.lock
+// invalidates ownership even when the pathname is unchanged.
+func (lock *workspaceLock) referencesNamedFile() bool {
+	if lock == nil || lock.file == nil || strings.TrimSpace(lock.path) == "" {
+		return false
+	}
+	held, err := lock.file.Stat()
+	if err != nil {
+		return false
+	}
+	named, err := os.Stat(lock.path)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(held, named)
+}
+
 func readWorkspaceLockMetadata(file *os.File) workspaceLockMetadata {
 	if file == nil {
 		return workspaceLockMetadata{}
@@ -241,6 +296,51 @@ func (s *server) requireWorkspaceOwnership(workspacePath string) error {
 		canonical = workspacePath
 	}
 	return fmt.Errorf("workspace %s is not owned by this pua serve instance; management and write operations are disabled", canonical)
+}
+
+func (s *server) requireWorkspaceRemovalClaim(workspacePath string) error {
+	if s.locks == nil || s.locks.holds(workspacePath) {
+		return nil
+	}
+	canonical, err := canonicalWorkspacePath(workspacePath)
+	if err != nil {
+		canonical = workspacePath
+	}
+	return fmt.Errorf("workspace %s has no advisory-lock claim held by this pua serve instance", canonical)
+}
+
+// requireWorkspaceInstanceOwnership binds path ownership to the persisted
+// Workspace identity. Startup backfills legacy blank identities before any
+// ordinary jobs are admitted; a blank configured identity remains valid only
+// for the conservative stale-removal path, which does not call this helper.
+// Servers without a lock manager are isolated unit-test fixtures rather than
+// production owners and retain the historical live-identity fallback.
+func (s *server) requireWorkspaceInstanceOwnership(workspace serveWorkspace) (string, error) {
+	if err := s.requireWorkspaceOwnership(workspace.Path); err != nil {
+		return "", &resourceAPIError{Code: "workspace_not_owned", Message: err.Error()}
+	}
+	configured := strings.TrimSpace(workspace.InstanceID)
+	if configured == "" && s.locks != nil {
+		return "", &resourceAPIError{
+			Code:    "workspace_not_owned",
+			Message: fmt.Sprintf("workspace %s has no persisted runtime identity; ordinary jobs are disabled until startup backfill succeeds", workspace.ID),
+		}
+	}
+	live, err := workspaceInstanceID(workspace.Path)
+	if err != nil {
+		return "", &resourceAPIError{
+			Code:    "workspace_not_owned",
+			Message: fmt.Sprintf("workspace %s runtime identity is unavailable: %v", workspace.ID, err),
+		}
+	}
+	live = strings.TrimSpace(live)
+	if live == "" || (configured != "" && live != configured) {
+		return "", &resourceAPIError{
+			Code:    "workspace_not_owned",
+			Message: fmt.Sprintf("workspace %s runtime identity no longer matches this pua serve configuration", workspace.ID),
+		}
+	}
+	return live, nil
 }
 
 // acquireConfiguredWorkspaceLocks takes ownership of every configured

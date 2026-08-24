@@ -1,3 +1,0 @@
-PUA Scheduler tick {{.MessageID}}（{{.Reason}}）。
-
-读取 ../AGENTS.md、AGENTS.md、scheduler.json 和 scheduler.md。结合当前环境和持久上下文判断所有现有 schedule 的自然语言 condition。对于判断为已满足的条件，向目标发送普通 PUA 消息，并包含 schedule ID、description 和本次触发原因。消息可能重复。条件允许时，在执行前重新读取 scheduler.json；仅在持久判断上下文确有价值时维护 scheduler.md。

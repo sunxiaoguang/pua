@@ -1,0 +1,10 @@
+{{if eq .Operation "create"}}请创建一个原生定时任务。{{else}}请编辑原生定时任务 {{printf "%q" .ID}}。{{end}}
+
+- 操作：`{{.Operation}}`
+{{if .HasID}}- Schedule ID：{{printf "%q" .ID}}
+{{end}}{{if .HasExpectedRevision}}- 预期 revision：`{{.ExpectedRevision}}`
+{{end}}- 动作描述：{{printf "%q" .Description}}
+- 原始条件：{{printf "%q" .Condition}}
+- 目标资源：{{printf "%q" .Target}}
+
+请使用 Scheduler CLI 将此请求编译为结构化 trigger。{{if .HasExpectedRevision}}调用 `pua scheduler update` 时必须原样传入 `--revision={{.ExpectedRevision}}`；不得重新读取 schedule 后改用更新的 revision。如果命令返回 `schedule_revision_conflict`，请保持并发产生的新定义不变并报告冲突。{{end}}如果执行时间、重复方式或 IANA 时区有歧义，请在当前 Turn 中向我询问，在澄清前不得修改现有定义。

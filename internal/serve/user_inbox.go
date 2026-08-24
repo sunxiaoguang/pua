@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -219,7 +220,7 @@ func (m *agentManager) handleUserMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if len(parts) == 2 && parts[1] == "read" && r.Method == http.MethodPut {
-		m.markUserInboxMessageRead(w, workspaceID, workspace.Path, userName, parts[0])
+		m.markUserInboxMessageRead(w, r, workspaceID, workspace, userName, parts[0])
 		return
 	}
 	if len(parts) == 2 && parts[1] == "reply" && r.Method == http.MethodPost {
@@ -227,7 +228,7 @@ func (m *agentManager) handleUserMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if len(parts) == 1 && r.Method == http.MethodDelete {
-		m.deleteUserInboxMessage(w, workspace.Path, userName, parts[0])
+		m.deleteUserInboxMessage(w, r, workspace, userName, parts[0])
 		return
 	}
 	http.NotFound(w, r)
@@ -312,12 +313,15 @@ func (m *agentManager) acceptUserInboxMessage(w http.ResponseWriter, r *http.Req
 		SourceResourceID: sourceResourceID, SourceWorkspaceInstanceID: instanceID,
 		SenderName: senderName, CreatedAt: now,
 	}
-	_, err = mutateUserInbox(workspace.Path, userName, func(inbox *userInbox) error {
-		inbox.NextSequence++
-		message.Sequence = inbox.NextSequence
-		inbox.Messages = append(inbox.Messages, message)
-		pruneUserInboxLocked(inbox)
-		return nil
+	err = m.server.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+		_, mutateErr := mutateUserInbox(current.Path, userName, func(inbox *userInbox) error {
+			inbox.NextSequence++
+			message.Sequence = inbox.NextSequence
+			inbox.Messages = append(inbox.Messages, message)
+			pruneUserInboxLocked(inbox)
+			return nil
+		})
+		return mutateErr
 	})
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -329,23 +333,26 @@ func (m *agentManager) acceptUserInboxMessage(w http.ResponseWriter, r *http.Req
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func (m *agentManager) markUserInboxMessageRead(w http.ResponseWriter, workspaceID, workspacePath, userName, messageID string) {
+func (m *agentManager) markUserInboxMessageRead(w http.ResponseWriter, r *http.Request, workspaceID string, workspace serveWorkspace, userName, messageID string) {
 	messageID = strings.TrimSpace(messageID)
 	now := time.Now().Format(time.RFC3339Nano)
 	var updated userInboxMessage
 	found := false
-	_, err := mutateUserInbox(workspacePath, userName, func(inbox *userInbox) error {
-		for index := range inbox.Messages {
-			if inbox.Messages[index].ID != messageID {
-				continue
+	err := m.server.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+		_, mutateErr := mutateUserInbox(current.Path, userName, func(inbox *userInbox) error {
+			for index := range inbox.Messages {
+				if inbox.Messages[index].ID != messageID {
+					continue
+				}
+				if inbox.Messages[index].ReadAt == "" {
+					inbox.Messages[index].ReadAt = now
+				}
+				updated, found = inbox.Messages[index], true
+				return nil
 			}
-			if inbox.Messages[index].ReadAt == "" {
-				inbox.Messages[index].ReadAt = now
-			}
-			updated, found = inbox.Messages[index], true
 			return nil
-		}
-		return nil
+		})
+		return mutateErr
 	})
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -412,18 +419,21 @@ func (m *agentManager) replyUserInboxMessage(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	now := time.Now().Format(time.RFC3339Nano)
-	_, _ = mutateUserInbox(workspace.Path, userName, func(inbox *userInbox) error {
-		for index := range inbox.Messages {
-			if inbox.Messages[index].ID == messageID {
-				if inbox.Messages[index].RepliedAt == "" {
-					inbox.Messages[index].RepliedAt = now
-				}
-				if inbox.Messages[index].ReadAt == "" {
-					inbox.Messages[index].ReadAt = now
+	_ = m.server.withWorkspaceMutation(context.WithoutCancel(r.Context()), workspace, "workspace", func(current serveWorkspace) error {
+		_, mutateErr := mutateUserInbox(current.Path, userName, func(inbox *userInbox) error {
+			for index := range inbox.Messages {
+				if inbox.Messages[index].ID == messageID {
+					if inbox.Messages[index].RepliedAt == "" {
+						inbox.Messages[index].RepliedAt = now
+					}
+					if inbox.Messages[index].ReadAt == "" {
+						inbox.Messages[index].ReadAt = now
+					}
 				}
 			}
-		}
-		return nil
+			return nil
+		})
+		return mutateErr
 	})
 	response := mailboxMessageResponse(accepted)
 	response.Reference = fmt.Sprintf("/api/workspaces/%s/messages/%s", workspaceID, accepted.ID)
@@ -432,19 +442,22 @@ func (m *agentManager) replyUserInboxMessage(w http.ResponseWriter, r *http.Requ
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func (m *agentManager) deleteUserInboxMessage(w http.ResponseWriter, workspacePath, userName, messageID string) {
+func (m *agentManager) deleteUserInboxMessage(w http.ResponseWriter, r *http.Request, workspace serveWorkspace, userName, messageID string) {
 	messageID = strings.TrimSpace(messageID)
 	found := false
-	_, err := mutateUserInbox(workspacePath, userName, func(inbox *userInbox) error {
-		for index := range inbox.Messages {
-			if inbox.Messages[index].ID != messageID {
-				continue
+	err := m.server.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+		_, mutateErr := mutateUserInbox(current.Path, userName, func(inbox *userInbox) error {
+			for index := range inbox.Messages {
+				if inbox.Messages[index].ID != messageID {
+					continue
+				}
+				inbox.Messages = append(inbox.Messages[:index], inbox.Messages[index+1:]...)
+				found = true
+				return nil
 			}
-			inbox.Messages = append(inbox.Messages[:index], inbox.Messages[index+1:]...)
-			found = true
 			return nil
-		}
-		return nil
+		})
+		return mutateErr
 	})
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)

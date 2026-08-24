@@ -28,9 +28,8 @@ function model(overrides: Partial<DetailPanelModel> = {}): DetailPanelModel {
       title: "Scheduler",
       path: "scheduler",
       scheduler: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         agentBinding: { kind: "profile", name: "default" },
-        wakeIntervalMinutes: 30,
         schedules: [],
       },
     },
@@ -62,7 +61,6 @@ function model(overrides: Partial<DetailPanelModel> = {}): DetailPanelModel {
     onSaveGenerationPolicy: vi.fn(async () => undefined),
     onSaveStallWatchdogPolicy: vi.fn(async () => undefined),
     onSaveTaskDefault: vi.fn(async () => undefined),
-    onRefreshScheduler: vi.fn(async () => undefined),
     onToast: vi.fn(),
     ...overrides,
   };
@@ -159,7 +157,7 @@ describe("ResourceSettingsPanel", () => {
     await vi.waitFor(() => expect(onSaveStallWatchdogPolicy).toHaveBeenCalledWith({ enabled: false, timeoutMinutes: 45 }));
   });
 
-  it("shows range feedback and disables Save for an invalid Scheduler interval", async () => {
+  it("keeps Scheduler settings focused on the compilation Agent", async () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     const target = document.body.appendChild(document.createElement("div"));
@@ -167,32 +165,9 @@ describe("ResourceSettingsPanel", () => {
     cleanups.push(() => unmount(component));
     await tick();
 
-    const input = target.querySelector<HTMLInputElement>('[aria-label="Scheduler wake interval in minutes"]')!;
-    const save = target.querySelector<HTMLButtonElement>(".resource-settings-interval button")!;
-    expect(input.getAttribute("aria-invalid")).toBeNull();
-    expect(save.disabled).toBe(true);
-
-    input.value = "0";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await tick();
-
-    expect(input.getAttribute("aria-invalid")).toBe("true");
-    expect(input.getAttribute("aria-describedby")).toBe("schedulerIntervalError");
-    expect(target.querySelector("#schedulerIntervalError")?.textContent).toContain("between 1 and 10080 minutes");
-    expect(save.disabled).toBe(true);
+    expect(target.querySelector('[aria-label="Scheduler wake interval in minutes"]')).toBeNull();
+    expect(target.textContent).toContain("Compiles and manages schedule definitions");
+    expect(target.querySelector('[aria-label="Scheduler Agent binding"]')).not.toBeNull();
     expect(fetch).not.toHaveBeenCalled();
-
-    input.value = "10081";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await tick();
-    expect(input.getAttribute("aria-invalid")).toBe("true");
-    expect(save.disabled).toBe(true);
-
-    input.value = "45";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await tick();
-    expect(input.getAttribute("aria-invalid")).toBeNull();
-    expect(target.querySelector("#schedulerIntervalError")).toBeNull();
-    expect(save.disabled).toBe(false);
   });
 });

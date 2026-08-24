@@ -1,0 +1,3 @@
+PUA Scheduler 迁移 {{.MessageID}} 发现 {{.Count}} 个需要编译原生 trigger 的 v1 schedule：{{.ScheduleIDs}}。
+
+读取每个原始 condition，然后使用 `pua scheduler update` 携带当前 revision，并且只提交一种结构化 trigger（`--at`、`--every` 加 `--anchor`，或 `--cron` 加 `--timezone`）。有歧义时保持旧定义不变，先在本 Turn 中询问用户。`scheduler` 管理资源自身不能作为执行 target，历史定义若以它为 target，必须先请用户重新选择 target，再进行编译。不得猜测 IANA 时区。

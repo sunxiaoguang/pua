@@ -217,16 +217,16 @@ pua message send --to=<username> '<message>'
 
 ## 7. Scheduler
 
-Scheduler 适合定时触发、条件触发，以及需要长时间等待外部事件的工作。
-
-Schedule 使用自然语言描述条件，不使用 cron 表达式：
+Scheduler 适合定时触发、带 guard 的触发，以及需要长时间等待的工作。Scheduler Agent 负责把自然语言请求编译为结构化规则；正常计时不再需要周期性 Agent Turn。
 
 ~~~sh
-pua scheduler list [--json]
-pua scheduler show --id=<schedule>
-pua scheduler add --description=<text> --condition=<text> --target=<resource>
-pua scheduler update --id=<schedule> [--description=<text>] [--condition=<text>] [--target=<resource>]
-pua scheduler remove --id=<schedule>
+pua scheduler list [--json] [--server=<url>]
+pua scheduler show --id=<schedule> [--server=<url>]
+pua scheduler add --description=<text> --condition=<text> --target=<resource> --at=<rfc3339>
+pua scheduler add --description=<text> --condition=<text> --target=<resource> --every=5m --anchor=<rfc3339>
+pua scheduler add --description=<text> --condition=<text> --target=<resource> --cron='0 0 9 * * *' --timezone=Asia/Shanghai
+pua scheduler update --id=<schedule> --revision=<n> [--description=<text>] [--condition=<text>] [--guard=<text>] [--target=<resource>] (--at=<rfc3339>|--every=<duration> --anchor=<rfc3339>|--cron=<six-fields> --timezone=<iana>)
+pua scheduler pause|resume|remove --id=<schedule>
 ~~~
 
 也可以直接给 Scheduler Agent 发消息：
@@ -235,6 +235,4 @@ pua scheduler remove --id=<schedule>
 pua message send --to=scheduler '<request>'
 ~~~
 
-description 说明要做什么，condition 写清触发时间或条件、时区、是否重复以及何时停止，target 使用稳定资源 ID。
-
-条件满足后，Scheduler 会给目标资源发送普通消息，说明 schedule ID 和触发原因。调度消息可能重复，目标 Agent 应避免重复执行。
+description 是动作，condition 保留用户原始表述，guard 是到点后由目标 Agent 检查的可选谓词，target 使用稳定资源 ID。编辑请求必须编译为且只编译为一个完整的替换 trigger。更新时非 trigger 字段可选，但必须携带当前 revision 执行 compare-and-swap。时间或 IANA 时区有歧义时，先请求澄清，不得猜测；编译、校验或 compare-and-swap 失败时，保持原 schedule 不变。Occurrence 消息采用 at-least-once 语义；产生外部副作用时使用 occurrence ID 做幂等去重。

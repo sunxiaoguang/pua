@@ -317,8 +317,10 @@ Commands:
     binding, repo.
 
   pua scheduler <command>
-    Manage natural-language schedules. Subcommands: list, show, add, update,
-    remove.
+    Manage native structured schedules through the owning pua serve process.
+    Subcommands: list, show, add, update, pause, resume, remove. Add and update
+    require --at, --every with --anchor, or --cron with --timezone. Use the Web
+    UI or Scheduler Agent to compile natural-language requests.
 
   pua template <command>
     Manage project-local content templates. Subcommands: list, show, validate,
@@ -557,28 +559,44 @@ Commands:
 
 func printSchedulerHelp() {
 	fmt.Print(`Usage:
-  pua scheduler list [--json]
-  pua scheduler show --id=<schedule>
-  pua scheduler add --description=<text> --condition=<text> --target=<resource>
-  pua scheduler update --id=<schedule> [--description=<text>] [--condition=<text>] [--target=<resource>]
-  pua scheduler remove --id=<schedule>
+  pua scheduler list [--json] [--server=<url>]
+  pua scheduler show --id=<schedule> [--server=<url>]
+  pua scheduler add --description=<text> --condition=<text> --target=<resource> [--guard=<text>] (--at=<rfc3339>|--every=<duration> --anchor=<rfc3339>|--cron=<six-fields> --timezone=<iana>) [--server=<url>]
+  pua scheduler update --id=<schedule> --revision=<n> [--description=<text>] [--condition=<text>] [--guard=<text>] [--target=<resource>] (--at=<rfc3339>|--every=<duration> --anchor=<rfc3339>|--cron=<six-fields> --timezone=<iana>) [--server=<url>]
+  pua scheduler pause --id=<schedule> [--server=<url>]
+  pua scheduler resume --id=<schedule> [--server=<url>]
+  pua scheduler remove --id=<schedule> [--server=<url>]
 
 Commands:
-  pua scheduler list [--json]
-    List schedules. Use --json for structured output.
+  pua scheduler list [--json] [--server=<url>]
+    List schedules with runtime state, next run, and last outcome.
 
-  pua scheduler show --id=<schedule>
-    Print one schedule as JSON.
+  pua scheduler show --id=<schedule> [--server=<url>]
+    Print one portable definition and its runtime projection as JSON.
 
-  pua scheduler add --description=<text> --condition=<text> --target=<resource>
-    Create a natural-language schedule. <resource> is a stable resource id such
-    as workspace or project1.task1.
+  pua scheduler add ...
+    Create a native one-time, fixed-interval, or six-field cron schedule.
+    Cron timezones must be explicit IANA names; repeating rules run no more
+    frequently than once per 60 seconds.
 
-  pua scheduler update --id=<schedule> [--description=<text>] [--condition=<text>] [--target=<resource>]
-    Update one or more fields of an existing schedule.
+  pua scheduler update ...
+    Compare-and-swap an existing definition using its current revision and one
+    complete replacement trigger.
 
-  pua scheduler remove --id=<schedule>
-    Remove a schedule.
+  pua scheduler pause ...
+    Pause a definition without replaying occurrences missed while paused.
+
+  pua scheduler resume ...
+    Resume a definition from its next future occurrence.
+
+  pua scheduler remove ...
+    Remove a definition deterministically.
+
+All reads and mutations go through the owning pua serve process. If owner
+discovery fails, start the Server or pass --server explicitly.
+CLI add and update accept complete structured triggers only. Use the Web UI or
+Scheduler Agent to compile natural-language requests before changing a
+definition.
 `)
 }
 

@@ -217,16 +217,16 @@ The message lands in the user's Inbox panel in the Web GUI; the user's reply arr
 
 ## 7. Scheduler
 
-Scheduler is useful for timed triggers, conditional triggers, and work that needs to wait a long time for an external event.
-
-Schedules use natural-language conditions rather than cron expressions:
+Scheduler is useful for timed triggers, guarded triggers, and work that needs to wait a long time. The Scheduler Agent compiles natural-language requests; normal timing is native and does not require periodic Agent Turns.
 
 ~~~sh
-pua scheduler list [--json]
-pua scheduler show --id=<schedule>
-pua scheduler add --description=<text> --condition=<text> --target=<resource>
-pua scheduler update --id=<schedule> [--description=<text>] [--condition=<text>] [--target=<resource>]
-pua scheduler remove --id=<schedule>
+pua scheduler list [--json] [--server=<url>]
+pua scheduler show --id=<schedule> [--server=<url>]
+pua scheduler add --description=<text> --condition=<text> --target=<resource> --at=<rfc3339>
+pua scheduler add --description=<text> --condition=<text> --target=<resource> --every=5m --anchor=<rfc3339>
+pua scheduler add --description=<text> --condition=<text> --target=<resource> --cron='0 0 9 * * *' --timezone=Asia/Shanghai
+pua scheduler update --id=<schedule> --revision=<n> [--description=<text>] [--condition=<text>] [--guard=<text>] [--target=<resource>] (--at=<rfc3339>|--every=<duration> --anchor=<rfc3339>|--cron=<six-fields> --timezone=<iana>)
+pua scheduler pause|resume|remove --id=<schedule>
 ~~~
 
 You may also message the Scheduler agent directly:
@@ -235,6 +235,4 @@ You may also message the Scheduler agent directly:
 pua message send --to=scheduler '<request>'
 ~~~
 
-The description says what should happen. The condition says when to trigger, including timezone, repetition, and stopping behavior when relevant. The target is a stable PUA resource id.
-
-When a condition is met, Scheduler sends the target a normal message with the schedule id and trigger reason. Scheduled messages may repeat, so the target agent should avoid duplicate work.
+Description is the action, condition preserves the user's original wording, guard is an optional predicate checked by the target Agent, and target is a stable resource ID. An edit request must compile to exactly one complete replacement trigger. Non-trigger update fields are optional, but the current revision is required for compare-and-swap. If timing or the IANA timezone is ambiguous, ask for clarification instead of guessing. If compilation, validation, or compare-and-swap fails, leave the existing schedule unchanged. Occurrence messages are at-least-once; use their occurrence ID to make external side effects idempotent.

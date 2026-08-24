@@ -104,6 +104,47 @@ func TestWorkspaceLockReleaseAllowsTakeover(t *testing.T) {
 	}
 }
 
+func TestWorkspaceLockRejectsReplacedNamedInode(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := newWorkspaceLockManager("127.0.0.1:4936", filepath.Join(t.TempDir(), "first.json"))
+	second := newWorkspaceLockManager("127.0.0.1:4999", filepath.Join(t.TempDir(), "second.json"))
+	defer first.closeAll()
+	defer second.closeAll()
+	if _, err := first.acquire(workspace); err != nil {
+		t.Fatal(err)
+	}
+	if !first.owns(workspace) {
+		t.Fatal("unchanged named lock inode was not recognized")
+	}
+
+	if err := os.RemoveAll(workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The first descriptor still owns its unlinked inode, but it must not
+	// prevent a new Server from locking the replacement pathname.
+	if _, err := second.acquire(workspace); err != nil {
+		t.Fatalf("new owner could not lock replacement Workspace: %v", err)
+	}
+	if first.owns(workspace) {
+		t.Fatal("old owner accepted a descriptor for an unlinked lock inode")
+	}
+	if !first.holds(workspace) {
+		t.Fatal("failed ordinary ownership check discarded the stale-removal descriptor claim")
+	}
+	if !second.owns(workspace) {
+		t.Fatal("new owner did not retain the replacement lock")
+	}
+	if _, err := first.acquire(workspace); err == nil {
+		t.Fatal("old manager reacquired a replacement lock owned by another Server")
+	}
+}
+
 func TestAcquireConfiguredWorkspaceLocksAllOrNothing(t *testing.T) {
 	wsA := t.TempDir()
 	wsB := t.TempDir()

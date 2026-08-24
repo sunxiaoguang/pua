@@ -80,13 +80,20 @@ func (s *server) handleUsers(w http.ResponseWriter, r *http.Request, workspaceID
 				writeError(w, err, http.StatusBadRequest)
 				return
 			}
-			profile, err := puaWorkspace.RegisterUser(body.Name)
+			var profile app.UserProfile
+			err := s.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+				opened, openErr := app.OpenWorkspace(current.Path)
+				if openErr != nil {
+					return openErr
+				}
+				profile, openErr = opened.RegisterUser(body.Name)
+				if openErr != nil {
+					return openErr
+				}
+				return s.ensureUserUIStateBaseline(current.Path, profile.Name)
+			})
 			if err != nil {
 				writeError(w, err, http.StatusBadRequest)
-				return
-			}
-			if err := s.ensureUserUIStateBaseline(workspace.Path, profile.Name); err != nil {
-				writeError(w, err, http.StatusInternalServerError)
 				return
 			}
 			writeJSON(w, profile)
@@ -115,14 +122,29 @@ func (s *server) handleUsers(w http.ResponseWriter, r *http.Request, workspaceID
 			writeError(w, err, http.StatusBadRequest)
 			return
 		}
-		profile, err := puaWorkspace.UpdateUserPreference(name, body.Preference)
+		var profile app.UserProfile
+		err := s.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+			opened, openErr := app.OpenWorkspace(current.Path)
+			if openErr != nil {
+				return openErr
+			}
+			profile, openErr = opened.UpdateUserPreference(name, body.Preference)
+			return openErr
+		})
 		if err != nil {
 			writeError(w, err, http.StatusNotFound)
 			return
 		}
 		writeJSON(w, profile)
 	case http.MethodDelete:
-		if err := puaWorkspace.DeleteUser(name); err != nil {
+		err := s.withWorkspaceMutation(r.Context(), workspace, "workspace", func(current serveWorkspace) error {
+			opened, openErr := app.OpenWorkspace(current.Path)
+			if openErr != nil {
+				return openErr
+			}
+			return opened.DeleteUser(name)
+		})
+		if err != nil {
 			if errors.Is(err, app.ErrLastUser) {
 				writeError(w, &resourceAPIError{Code: "last_user", Message: app.ErrLastUser.Error()}, http.StatusConflict)
 				return

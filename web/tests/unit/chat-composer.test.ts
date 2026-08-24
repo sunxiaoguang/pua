@@ -276,7 +276,7 @@ describe("ChatComposer", () => {
     const onSteerWaiting = vi.fn(async () => undefined);
     const channel = createModelChannel(model({
       canSteerWaiting: true,
-      waitingMessages: [{ messageId: "msg-waiting", text: "Please check the failing test", status: "waiting", acceptedAt: "2026-08-12T12:00:00Z", requestedMode: "enqueue", actualMode: "enqueue" }],
+      waitingMessages: [{ messageId: "msg-waiting", text: "Please check the failing test", status: "waiting", acceptedAt: "2026-08-12T12:00:00Z", requestedMode: "enqueue", actualMode: "enqueue", canPromote: true }],
       onSteerWaiting,
     }));
     const target = document.body.appendChild(document.createElement("div"));
@@ -293,7 +293,7 @@ describe("ChatComposer", () => {
 
   it("keeps insert disabled when the current turn cannot steer", async () => {
     const channel = createModelChannel(model({
-      waitingMessages: [{ messageId: "msg-waiting", text: "Wait here", status: "waiting", acceptedAt: "", requestedMode: "enqueue", actualMode: "enqueue" }],
+      waitingMessages: [{ messageId: "msg-waiting", text: "Wait here", status: "waiting", acceptedAt: "", requestedMode: "enqueue", actualMode: "enqueue", canPromote: true }],
     }));
     const target = document.body.appendChild(document.createElement("div"));
     const component = mount(ChatComposer, { target, props: { channel } });
@@ -301,6 +301,25 @@ describe("ChatComposer", () => {
     await tick();
 
     expect(target.querySelector<HTMLButtonElement>(".chat-message-steer")?.disabled).toBe(true);
+  });
+
+  it("keeps generated waiting messages non-promotable during a steer-capable turn", async () => {
+    const onSteerWaiting = vi.fn(async () => undefined);
+    const channel = createModelChannel(model({
+      canSteerWaiting: true,
+      waitingMessages: [{ messageId: "msg-occurrence", text: "Run scheduled work", status: "waiting", acceptedAt: "", requestedMode: "enqueue", actualMode: "enqueue", canPromote: false }],
+      onSteerWaiting,
+    }));
+    const target = document.body.appendChild(document.createElement("div"));
+    const component = mount(ChatComposer, { target, props: { channel } });
+    cleanups.push(() => unmount(component));
+    await tick();
+
+    const button = target.querySelector<HTMLButtonElement>(".chat-message-steer")!;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toContain("generated message");
+    button.click();
+    expect(onSteerWaiting).not.toHaveBeenCalled();
   });
 
   it("shows the stop policy notice and lets the user dismiss it", async () => {

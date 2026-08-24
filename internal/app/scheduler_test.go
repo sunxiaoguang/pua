@@ -2,12 +2,14 @@ package app_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/disksing/pua/internal/app"
 )
@@ -22,7 +24,7 @@ func TestInitializeCreatesSchedulerResource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.SchemaVersion != 1 || config.AgentBinding.Kind != "profile" || config.AgentBinding.Name != "default" || config.WakeIntervalMinutes != 30 || len(config.Schedules) != 0 {
+	if config.SchemaVersion != 2 || config.AgentBinding.Kind != "profile" || config.AgentBinding.Name != "default" || len(config.Schedules) != 0 {
 		t.Fatalf("default Scheduler configuration = %#v", config)
 	}
 	tree, err := workspace.Tree()
@@ -43,11 +45,11 @@ func TestInitializeCreatesSchedulerResource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(agents), "../AGENTS.md") || !strings.Contains(string(agents), "schedule ID") || !strings.Contains(string(agents), "不要把它当作长期历史") {
+	if !strings.Contains(string(agents), "../AGENTS.md") || !strings.Contains(string(agents), "needs_compilation") || !strings.Contains(string(agents), "不得直接覆写") || !strings.Contains(string(agents), "不能作为执行 target") {
 		t.Fatalf("Scheduler guidance is incomplete:\n%s", agents)
 	}
 	schedulerMarkdown, err := os.ReadFile(filepath.Join(workspace.Root(), "scheduler", "scheduler.md"))
-	if err != nil || !strings.Contains(string(schedulerMarkdown), "后续调度判断所需的最小上下文") {
+	if err != nil || !strings.Contains(string(schedulerMarkdown), "完成调度编译或澄清所需的最小上下文") {
 		t.Fatalf("Scheduler context guidance is incomplete: %v\n%s", err, schedulerMarkdown)
 	}
 	inside, err := workspace.IsSchedulerPath(filepath.Join(workspace.Root(), "scheduler", "nested"))
@@ -138,6 +140,7 @@ func TestScheduleLifecycleValidatesTargets(t *testing.T) {
 		Description: "  Remind the target  ",
 		Condition:   "  tomorrow morning  ",
 		Target:      task.ID,
+		Trigger:     &app.ScheduleTrigger{Type: app.ScheduleTriggerAt, At: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -147,54 +150,64 @@ func TestScheduleLifecycleValidatesTargets(t *testing.T) {
 	}
 	condition := "when the build is green"
 	target := app.SchedulerResourceID
-	updated, err := workspace.UpdateSchedule(app.UpdateScheduleInput{ID: created.ID, Condition: &condition, Target: &target})
+	if _, err := workspace.UpdateSchedule(app.UpdateScheduleInput{ID: created.ID, ExpectedRevision: created.Revision, Condition: &condition, Target: &target}); !errors.Is(err, app.ErrScheduleTargetScheduler) || err.Error() != "update schedule: "+app.ErrScheduleTargetScheduler.Error() {
+		t.Fatalf("Scheduler self-target update error = %v", err)
+	}
+	config, err := workspace.Scheduler()
+	if err != nil || len(config.Schedules) != 1 || config.Schedules[0].Revision != created.Revision || config.Schedules[0].Condition != created.Condition || config.Schedules[0].Target != created.Target {
+		t.Fatalf("rejected self-target changed Scheduler configuration: %#v, %v", config, err)
+	}
+	target = "workspace"
+	updated, err := workspace.UpdateSchedule(app.UpdateScheduleInput{ID: created.ID, ExpectedRevision: created.Revision, Condition: &condition, Target: &target})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.Condition != condition || updated.Target != target || updated.CreatedAt != created.CreatedAt {
 		t.Fatalf("updated schedule = %#v", updated)
 	}
-	if _, err := workspace.AddSchedule(app.CreateScheduleInput{Description: "Bad", Condition: "now", Target: "project999.task999"}); err == nil {
+	if _, err := workspace.AddSchedule(app.CreateScheduleInput{
+		Description: "Self target", Condition: "later", Target: app.SchedulerResourceID,
+		Trigger: &app.ScheduleTrigger{Type: app.ScheduleTriggerAt, At: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)},
+	}); !errors.Is(err, app.ErrScheduleTargetScheduler) || err.Error() != "add schedule: "+app.ErrScheduleTargetScheduler.Error() {
+		t.Fatalf("Scheduler self-target create error = %v", err)
+	}
+	if _, err := workspace.AddSchedule(app.CreateScheduleInput{
+		Description: "Bad", Condition: "now", Target: "project999.task999",
+		Trigger: &app.ScheduleTrigger{Type: app.ScheduleTriggerAt, At: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)},
+	}); err == nil {
 		t.Fatal("missing cross-resource target unexpectedly accepted")
 	}
 	if _, err := workspace.ArchiveResource(task.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := workspace.AddSchedule(app.CreateScheduleInput{Description: "Archived", Condition: "now", Target: task.ID}); err == nil {
+	if _, err := workspace.AddSchedule(app.CreateScheduleInput{
+		Description: "Archived", Condition: "now", Target: task.ID,
+		Trigger: &app.ScheduleTrigger{Type: app.ScheduleTriggerAt, At: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)},
+	}); err == nil {
 		t.Fatal("archived target unexpectedly accepted")
 	}
 	removed, err := workspace.RemoveSchedule(created.ID)
 	if err != nil || removed.ID != created.ID {
 		t.Fatalf("removed schedule = %#v, %v", removed, err)
 	}
-	config, err := workspace.Scheduler()
+	config, err = workspace.Scheduler()
 	if err != nil || len(config.Schedules) != 0 {
 		t.Fatalf("Scheduler after removal = %#v, %v", config, err)
 	}
 }
 
-func TestSchedulerSettingsAndConcurrentScheduleWrites(t *testing.T) {
+func TestSchedulerResourceBindingAndConcurrentScheduleWrites(t *testing.T) {
 	workspace, err := app.Initialize(t.TempDir(), "en")
 	if err != nil {
 		t.Fatal(err)
-	}
-	config, err := workspace.SetSchedulerSettings(app.SchedulerSettingsInput{
-		AgentBinding:        app.AgentBinding{Kind: "agent", Name: "reviewer"},
-		WakeIntervalMinutes: 45,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if config.AgentBinding.Kind != "agent" || config.AgentBinding.Name != "reviewer" || config.WakeIntervalMinutes != 45 {
-		t.Fatalf("Scheduler settings = %#v", config)
 	}
 	binding := app.AgentBinding{Kind: "profile", Name: "fast"}
 	if got, err := workspace.SetResourceAgentBinding(app.SchedulerResourceID, binding); err != nil || got != binding {
 		t.Fatalf("set Scheduler resource binding = %#v, %v", got, err)
 	}
-	config, err = workspace.Scheduler()
-	if err != nil || config.AgentBinding != binding || config.WakeIntervalMinutes != 45 {
-		t.Fatalf("resource binding update drifted Scheduler settings = %#v, %v", config, err)
+	config, err := workspace.Scheduler()
+	if err != nil || config.AgentBinding != binding {
+		t.Fatalf("Scheduler resource binding = %#v, %v", config, err)
 	}
 	const count = 16
 	var wait sync.WaitGroup
@@ -207,6 +220,7 @@ func TestSchedulerSettingsAndConcurrentScheduleWrites(t *testing.T) {
 				Description: fmt.Sprintf("Concurrent schedule %d", index),
 				Condition:   "when appropriate",
 				Target:      "workspace",
+				Trigger:     &app.ScheduleTrigger{Type: app.ScheduleTriggerAt, At: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)},
 			})
 			if addErr != nil {
 				errors <- addErr
@@ -248,7 +262,10 @@ func TestMigratePreservesSchedulerContentAndRejectsUnsafeConflicts(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := workspace.AddSchedule(app.CreateScheduleInput{Description: "Keep me", Condition: "next week", Target: "workspace"})
+	created, err := workspace.AddSchedule(app.CreateScheduleInput{
+		Description: "Keep me", Condition: "next week", Target: "workspace",
+		Trigger: &app.ScheduleTrigger{Type: app.ScheduleTriggerAt, At: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

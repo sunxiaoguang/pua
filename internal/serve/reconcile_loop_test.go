@@ -33,6 +33,36 @@ func TestReconcileRequestsCoalesce(t *testing.T) {
 	}
 }
 
+func TestColdAuditKeepsSchedulerWorkThatBecomesDue(t *testing.T) {
+	startedAt := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	deadline := startedAt.Add(time.Second)
+	finishedAt := deadline.Add(time.Nanosecond)
+
+	request, nextDeadline := finishColdAuditRequests(reconcileColdAudit, deadline, finishedAt)
+
+	if request&reconcileScheduler == 0 {
+		t.Fatalf("post-audit reconcile request = %08b, want Scheduler", request)
+	}
+	if !nextDeadline.IsZero() {
+		t.Fatalf("post-audit Scheduler deadline = %v, want zero after promoting it to a request", nextDeadline)
+	}
+}
+
+func TestColdAuditPreservesRequestedSchedulerWork(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	deadline := now.Add(time.Minute)
+	request := reconcileColdAudit | reconcileAgentHub | reconcileMailboxes | reconcileNotifications | reconcileScheduler
+
+	request, nextDeadline := finishColdAuditRequests(request, deadline, now)
+
+	if request != reconcileColdAudit|reconcileScheduler {
+		t.Fatalf("post-audit reconcile request = %08b, want cold audit and Scheduler", request)
+	}
+	if !nextDeadline.Equal(deadline) {
+		t.Fatalf("post-audit Scheduler deadline = %v, want %v", nextDeadline, deadline)
+	}
+}
+
 func TestGenerationNeedsFastReconcileSkipsStableAndSelectsWork(t *testing.T) {
 	manager := newAgentManager(&server{})
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)

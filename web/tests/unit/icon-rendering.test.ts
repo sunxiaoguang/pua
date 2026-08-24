@@ -87,7 +87,7 @@ function composerModel(overrides: Partial<ComposerModel> = {}): ComposerModel {
   };
 }
 
-const waitingMessage: WaitingMessage = { messageId: "m1", text: "hello", status: "waiting", acceptedAt: "", requestedMode: "steer", actualMode: "steer" };
+const waitingMessage: WaitingMessage = { messageId: "m1", text: "hello", status: "waiting", acceptedAt: "", requestedMode: "steer", actualMode: "steer", canPromote: true };
 
 async function mountShell(channel: ReturnType<typeof createModelChannel<AppShellModel>>): Promise<void> {
   const target = document.createElement("div");

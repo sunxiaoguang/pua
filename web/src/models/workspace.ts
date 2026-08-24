@@ -54,20 +54,42 @@ export interface ResourceRuntime {
   turnStartedAt?: string;
 }
 
+export type SchedulerRevision = string;
+
+const maximumSchedulerRevision: SchedulerRevision = "18446744073709551615";
+
+export function isSchedulerRevision(value: unknown): value is SchedulerRevision {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) return false;
+  return value.length < maximumSchedulerRevision.length
+    || (value.length === maximumSchedulerRevision.length && value <= maximumSchedulerRevision);
+}
+
 export interface ScheduleRecord {
   id: string;
+  revision: SchedulerRevision;
   description: string;
   condition: string;
+  guard?: string;
   target: string;
+  state: "active" | "paused" | "completed" | "needs_compilation";
+  trigger?:
+    | { type: "at"; at: string }
+    | { type: "interval"; everySeconds: number; anchorAt: string }
+    | { type: "cron"; cron: string; timeZone: string };
   createdAt: string;
   updatedAt: string;
+  effectiveState: string;
+  nextRunAt?: string;
+  lastOccurrenceAt?: string;
+  lastOutcome?: string;
+  lastError?: string;
 }
 
 export interface SchedulerConfigRecord {
   schemaVersion: number;
   agentBinding: { kind: "profile" | "agent"; name: string };
-  wakeIntervalMinutes: number;
   schedules: ScheduleRecord[];
+  nextWakeAt?: string;
 }
 
 export interface ResourceAgentDefaultsRecord {

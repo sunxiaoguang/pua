@@ -36,11 +36,13 @@ const (
 	resourceResultSubscriptionNone     = "none"
 	resourceResultSubscriptionComplete = "complete"
 
-	resourceMessageTypeTurnResult        = "turn_result"
-	resourceMessageTypeDeliveryTerminal  = "delivery_terminal_notice"
-	resourceMessageTypeSchedulerTick     = "scheduler_tick"
-	resourceMessageTypeTaskContinuation  = "task_state_continuation"
-	resourceMessageTypeTurnStallRecovery = "turn_stall_recovery"
+	resourceMessageTypeTurnResult         = "turn_result"
+	resourceMessageTypeDeliveryTerminal   = "delivery_terminal_notice"
+	resourceMessageTypeSchedulerTick      = "scheduler_tick"
+	resourceMessageTypeScheduleOccurrence = "schedule_occurrence"
+	resourceMessageTypeScheduleMigration  = "schedule_migration"
+	resourceMessageTypeTaskContinuation   = "task_state_continuation"
+	resourceMessageTypeTurnStallRecovery  = "turn_stall_recovery"
 
 	resourceNotificationWaiting   = "waiting"
 	resourceNotificationAccepted  = "accepted"
@@ -97,6 +99,7 @@ type resourceMailboxMessage struct {
 	RequestedMode             string                       `json:"requestedMode"`
 	ActualMode                string                       `json:"actualMode"`
 	ModeFrozen                bool                         `json:"modeFrozen,omitempty"`
+	NonPromotable             bool                         `json:"nonPromotable,omitempty"`
 	DowngradeReason           string                       `json:"downgradeReason,omitempty"`
 	Status                    string                       `json:"status"`
 	AcceptedAt                string                       `json:"acceptedAt"`
@@ -159,6 +162,17 @@ type resourceMessageCausation struct {
 	TerminalCode              string   `json:"terminalCode,omitempty"`
 	Reason                    string   `json:"reason,omitempty"`
 	ScheduleDigest            string   `json:"scheduleDigest,omitempty"`
+	ScheduleID                string   `json:"scheduleId,omitempty"`
+	ScheduleRevision          uint64   `json:"scheduleRevision,omitempty"`
+	OccurrenceID              string   `json:"occurrenceId,omitempty"`
+	ScheduledFor              string   `json:"scheduledFor,omitempty"`
+	CoalescedFrom             string   `json:"coalescedFrom,omitempty"`
+	CoalescedThrough          string   `json:"coalescedThrough,omitempty"`
+	CoalescedCount            int      `json:"coalescedCount,omitempty"`
+	CronEnumerationCapped     bool     `json:"cronEnumerationCapped,omitempty"`
+	EnumeratedThrough         string   `json:"enumeratedThrough,omitempty"`
+	EnumeratedCount           int      `json:"enumeratedCount,omitempty"`
+	RecoveryCutoff            string   `json:"recoveryCutoff,omitempty"`
 }
 
 type resourceNotificationReceipt struct {
@@ -262,6 +276,7 @@ type resourceMessageResponse struct {
 	Type                     string                       `json:"type,omitempty"`
 	Causation                *resourceMessageCausation    `json:"causation,omitempty"`
 	Notification             *resourceNotificationReceipt `json:"notification,omitempty"`
+	CanPromote               bool                         `json:"canPromote"`
 }
 
 type resourceAPIError struct {
@@ -394,6 +409,7 @@ func mailboxMessageResponse(message resourceMailboxMessage) resourceMessageRespo
 		SubscribeResult: message.SubscribeResult, ResultSubscriptionStatus: message.ResultSubscriptionStatus, ResultOperationID: message.ResultOperationID,
 		LastError: message.LastError, LastErrorCode: message.LastErrorCode,
 		Type: message.Type, Causation: message.Causation, Notification: message.Notification,
+		CanPromote: message.Status == resourceMessageQueued && !message.NonPromotable,
 	}
 }
 
@@ -552,6 +568,7 @@ func acceptGeneratedMailboxMessage(workspacePath string, expected resourceMailbo
 	expected.SubscribeResult = false
 	expected.ResultSubscriptionStatus = resourceResultSubscriptionDisabled
 	expected.ResultOperationID = ""
+	expected.NonPromotable = true
 	expected.subscribeResultPresent = true
 	expected.RequestedMode = requestedMode
 	if expected.ModeFrozen {
@@ -900,6 +917,33 @@ func (m *agentManager) ensureRuntime(workspace serveWorkspace, record generation
 	return rt
 }
 
+// resolveMailboxGenerationAgent is the authoritative binding/profile/catalog
+// preflight for mailbox delivery that may need to create a generation. Only
+// semantic binding or catalog unavailability is permanent; configuration I/O
+// and AgentHub transport failures remain retryable errors.
+func (m *agentManager) resolveMailboxGenerationAgent(ctx context.Context, workspace serveWorkspace, resourceID string) (config, *agentHubClient, resolvedResourceAgent, error) {
+	cfg, client, err := m.agentHubRuntimeConfig()
+	if err != nil {
+		return config{}, nil, resolvedResourceAgent{}, err
+	}
+	resolved, err := m.resolveResourceAgent(workspace, resourceID, cfg)
+	if err != nil {
+		if isResourceAgentBindingUnavailable(err) {
+			err = &resourceAPIError{Code: "binding_unavailable", Message: err.Error()}
+		}
+		return config{}, client, resolved, err
+	}
+	resolved.AgentName, err = validateAgentHubGenerationAgent(ctx, client, resolved.AgentName)
+	if err != nil {
+		var unavailable *agentHubGenerationAgentUnavailableError
+		if errors.As(err, &unavailable) {
+			err = &resourceAPIError{Code: "binding_unavailable", Message: err.Error()}
+		}
+		return config{}, client, resolved, err
+	}
+	return cfg, client, resolved, nil
+}
+
 func (m *agentManager) ensureMailboxGeneration(ctx context.Context, workspace serveWorkspace, resourceID string) (generationRecord, *agentRuntime, *agentHubClient, error) {
 	if record, found, err := currentResourceGeneration(workspace.Path, resourceID); err != nil {
 		return generationRecord{}, nil, nil, err
@@ -910,21 +954,8 @@ func (m *agentManager) ensureMailboxGeneration(ctx context.Context, workspace se
 		}
 		return record, m.ensureRuntime(workspace, record, client), client, nil
 	}
-	cfg, client, err := m.agentHubRuntimeConfig()
+	cfg, client, resolved, err := m.resolveMailboxGenerationAgent(ctx, workspace, resourceID)
 	if err != nil {
-		return generationRecord{}, nil, nil, err
-	}
-	resolved, err := m.resolveResourceAgent(workspace, resourceID, cfg)
-	if err != nil {
-		return generationRecord{}, nil, client, &resourceAPIError{Code: "binding_unavailable", Message: err.Error()}
-	}
-	if err == nil {
-		resolved.AgentName, err = validateAgentHubGenerationAgent(ctx, client, resolved.AgentName)
-	}
-	if err != nil {
-		if strings.Contains(err.Error(), " is unavailable") || strings.Contains(err.Error(), "not present in the catalog") {
-			err = &resourceAPIError{Code: "binding_unavailable", Message: err.Error()}
-		}
 		return generationRecord{}, nil, client, err
 	}
 	cwd, err := m.generationCwd(ctx, workspace, resourceID, "")
@@ -951,6 +982,11 @@ func recordMailboxFailure(workspacePath, messageID string, err error) {
 		return
 	}
 	code := resourceDeliveryErrorCode(err)
+	// Ownership loss is a handoff boundary, not a delivery failure. A stale
+	// controller must not annotate the mailbox after another Server can own it.
+	if code == "workspace_not_owned" {
+		return
+	}
 	if current, found, loadErr := mailboxMessageByID(workspacePath, messageID); loadErr == nil && found &&
 		current.LastError == err.Error() && current.LastErrorCode == code {
 		return
@@ -989,8 +1025,10 @@ func (m *agentManager) acceptResourceMessage(ctx context.Context, workspace serv
 // wake the resource controller after this short durable boundary.
 func (m *agentManager) acceptResourceMessageDurable(ctx context.Context, workspace serveWorkspace, resourceID string, request resourceMessageRequest) (resourceMailboxMessage, error) {
 	resourceID = normalizedResourceID(resourceID)
-	if err := m.server.requireWorkspaceOwnership(workspace.Path); err != nil {
-		return resourceMailboxMessage{}, &resourceAPIError{Code: "workspace_not_owned", Message: err.Error()}
+	if m.server != nil {
+		if _, err := m.server.requireWorkspaceInstanceOwnership(workspace); err != nil {
+			return resourceMailboxMessage{}, err
+		}
 	}
 	exists, archived, _, err := resourceExistsAndArchived(workspace.Path, resourceID)
 	if err != nil || !exists {
@@ -1052,8 +1090,10 @@ func mailboxMessageResourceID(workspacePath, messageID string) (string, error) {
 }
 
 func (m *agentManager) promoteWaitingMessageLocked(ctx context.Context, workspace serveWorkspace, messageID string) (resourceMailboxMessage, error) {
-	if err := m.server.requireWorkspaceOwnership(workspace.Path); err != nil {
-		return resourceMailboxMessage{}, &resourceAPIError{Code: "workspace_not_owned", Message: err.Error()}
+	if m.server != nil {
+		if _, err := m.server.requireWorkspaceInstanceOwnership(workspace); err != nil {
+			return resourceMailboxMessage{}, err
+		}
 	}
 	message, found, err := mailboxMessageByID(workspace.Path, messageID)
 	if err != nil {
@@ -1064,6 +1104,11 @@ func (m *agentManager) promoteWaitingMessageLocked(ctx context.Context, workspac
 	}
 	if message.Status != resourceMessageQueued {
 		return resourceMailboxMessage{}, &resourceAPIError{Code: "message_not_waiting", Message: fmt.Sprintf("message %s is not waiting", messageID)}
+	}
+	if message.NonPromotable {
+		return resourceMailboxMessage{}, &resourceAPIError{
+			Code: "message_not_promotable", Message: fmt.Sprintf("message %s cannot be promoted", messageID),
+		}
 	}
 	_, archived, _, resourceErr := resourceExistsAndArchived(workspace.Path, message.ResourceID)
 	if resourceErr != nil {
@@ -1107,7 +1152,21 @@ func (m *agentManager) promoteWaitingMessageLocked(ctx context.Context, workspac
 }
 
 func (m *agentManager) reconcileResourceMailboxLocked(ctx context.Context, workspace serveWorkspace, resourceID string) error {
+	// Production reconciliation runs inside both its resource controller and
+	// the Workspace handoff barrier. Revalidate before even the Scheduler
+	// legacy-tick cleanup as defense in depth for isolated direct callers, which
+	// intentionally bypass production controller wiring.
+	if m.server != nil {
+		if _, err := m.server.requireWorkspaceInstanceOwnership(workspace); err != nil {
+			return err
+		}
+	}
 	resourceID = normalizedResourceID(resourceID)
+	if resourceID == app.SchedulerResourceID {
+		if err := newNativeScheduler(m, workspace).cancelLegacyTicks(ctx); err != nil {
+			return err
+		}
+	}
 	_, archived, _, resourceErr := resourceExistsAndArchived(workspace.Path, resourceID)
 	if resourceErr != nil {
 		return resourceErr
@@ -1412,6 +1471,12 @@ func (m *agentManager) reconcileResourceMailboxLocked(ctx context.Context, works
 					})
 				}
 			case resourceMessageModeEnqueue:
+				// An ordinary enqueue stays promotable while it waits behind an
+				// active Turn. Freeze it only at the inactive boundary where this
+				// pass can deliver it as the next Turn opener.
+				if active {
+					break
+				}
 				message, err = updateMailboxMessage(workspace.Path, message.ID, func(current *resourceMailboxMessage) {
 					current.ActualMode = resourceMessageModeEnqueue
 					current.ModeFrozen = true
@@ -1592,7 +1657,7 @@ func resourceErrorStatus(err error) int {
 		return http.StatusNotFound
 	case "message_receipt_expired":
 		return http.StatusGone
-	case "resource_archived", "message_not_waiting", "steer_unavailable", "generation_unavailable", "generation_changed", "active_turn":
+	case "resource_archived", "message_not_waiting", "message_not_promotable", "steer_unavailable", "generation_unavailable", "generation_changed", "active_turn":
 		return http.StatusConflict
 	case "workspace_not_owned":
 		return http.StatusConflict
@@ -1730,7 +1795,10 @@ func (m *agentManager) handleResourceMessages(w http.ResponseWriter, r *http.Req
 	// touch the user's read cursor.
 	if message.Role == "user" {
 		if userName, userErr := m.server.workspaceUserName(r, workspace.Path); userErr == nil {
-			m.server.markResourceReadOnUserMessage(workspace.Path, resourceID, userName)
+			_ = m.server.withWorkspaceMutation(context.WithoutCancel(r.Context()), workspace, resourceID, func(current serveWorkspace) error {
+				m.server.markResourceReadOnUserMessage(current.Path, resourceID, userName)
+				return nil
+			})
 		}
 	}
 	if wakeErr := m.enqueueResourceController(workspace, resourceID, func() error {

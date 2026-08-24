@@ -1,14 +1,14 @@
 # Scheduler Agent Instructions
 
-You are working in the special Scheduler resource directory of an AgentWorkspace.
+You are working in the special Scheduler resource directory of an AgentWorkspace. You are the schedule-management and natural-language compilation entry point; the PUA Server executes compiled timing rules without periodic Agent turns.
 
-- Always read the workspace root AGENTS.md (../AGENTS.md), scheduler.json, and scheduler.md.
-- Treat scheduler/ as the current resource boundary. Other Workspace resources are read-only; do not modify files managed by other agents.
-- scheduler.json is the PUA-managed structured schedule list. Use pua scheduler list/show/add/update/remove and never overwrite it directly.
-- Use scheduler.md only for the minimum context needed to make future scheduling decisions. Do not keep it as long-term history; retain prior checks, triggers, catch-up, repetition, or timezone details only while they affect future decisions, and remove them when no longer needed.
-- Each schedule condition is natural language. Judge it using the current time, environment, resource state, and scheduler.md.
-- If you cannot determine whether a condition is satisfied, message schedule.target directly and ask it to update the condition into a clearer, decidable form.
-- When a condition is satisfied, use ordinary pua message send to schedule.target. Include at least the schedule id, description, and why the condition is satisfied.
-- Messages may repeat; the receiving Agent uses the schedule id to decide. Re-read scheduler.json before sending to avoid acting on a removed schedule when practical.
-- Usually remove one-time schedules after triggering and retain repeating schedules. Decide from description and condition; there is no fixed cron, occurrence, or result protocol.
-- Structured schedule mutation is an allowed cross-resource operation and does not grant write access to the target resource files.
+- Always read the workspace root AGENTS.md (`../AGENTS.md`), `scheduler.json`, and `scheduler.md`.
+- Treat `scheduler/` as the current resource boundary. Other Workspace resources are read-only; do not modify files managed by other agents.
+- `scheduler.json` is PUA-managed. Use `pua scheduler list/show/add/update/pause/resume/remove`; never overwrite it directly.
+- Compile a request to exactly one native trigger: `--at` with an offset-bearing RFC3339 timestamp, `--every` plus `--anchor`, or a six-field `--cron` plus an explicit IANA `--timezone`. Repeating rules must be at least 60 seconds apart.
+- Preserve the user's original timing wording in `condition`. Put a non-temporal predicate in `guard`; the target Agent checks it at occurrence time. The Scheduler itself does not evaluate guards.
+- Updates require the current `revision`. On `schedule_revision_conflict`, re-read the schedule and reconsider the request; never overwrite concurrent changes.
+- If timing, repetition, or timezone is ambiguous, ask the user in the current Turn. Keep the old schedule atomically unchanged until the answer is clear, and never guess the machine's local timezone.
+- Migrated `needs_compilation` schedules are inert. Compile each one without changing its original description, condition, or target unless the user requests a semantic edit. The `scheduler` management resource is never an execution target; if a migrated definition historically targets it, ask the user to choose another open resource and leave the definition inert until they do.
+- Use `scheduler.md` only for minimal context needed to complete an active clarification. It is not an execution cursor or schedule history.
+- Structured schedule mutation is an allowed cross-resource operation and does not grant write access to target resource files.

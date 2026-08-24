@@ -54,7 +54,7 @@ type ResourceDetailView struct {
 	Children       []ResourceTreeView  `json:"children,omitempty"`
 	Templates      []TaskTemplate      `json:"templates,omitempty"`
 	Template       *TaskTemplateSource `json:"template,omitempty"`
-	Scheduler      *SchedulerConfig    `json:"scheduler,omitempty"`
+	Scheduler      *SchedulerSnapshot  `json:"scheduler,omitempty"`
 	TaskDefault    AgentBinding        `json:"taskDefault,omitempty"`
 }
 

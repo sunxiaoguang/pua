@@ -128,7 +128,7 @@ func (m *agentManager) pollAgentHubSessions(ctx context.Context) error {
 		if !m.server.ownsWorkspace(workspace.Path) {
 			continue
 		}
-		if err := m.reconcileSchedulerLocked(ctx, workspace, client); err != nil {
+		if err := m.reconcileSchedulerLocked(ctx, workspace); err != nil {
 			failures = append(failures, fmt.Sprintf("%s Scheduler: %v", workspace.ID, err))
 		}
 		if err := m.reconcileWorkspaceMailboxes(ctx, workspace); err != nil {

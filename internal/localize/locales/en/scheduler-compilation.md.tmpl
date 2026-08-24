@@ -1,0 +1,10 @@
+{{if eq .Operation "create"}}Please create a native schedule.{{else}}Please update a native schedule for {{printf "%q" .ID}}.{{end}}
+
+- Operation: `{{.Operation}}`
+{{if .HasID}}- Schedule ID: {{printf "%q" .ID}}
+{{end}}{{if .HasExpectedRevision}}- Expected revision: `{{.ExpectedRevision}}`
+{{end}}- Description: {{printf "%q" .Description}}
+- Condition: {{printf "%q" .Condition}}
+- Target: {{printf "%q" .Target}}
+
+Compile this request into a structured trigger with the Scheduler CLI. {{if .HasExpectedRevision}}Pass exactly `--revision={{.ExpectedRevision}}` to `pua scheduler update`; do not re-read the schedule and substitute a newer revision. If the command reports `schedule_revision_conflict`, leave the newer definition unchanged and report the conflict. {{end}}If the timing, recurrence, or IANA timezone is ambiguous, ask me in this Turn and do not modify the existing definition.

@@ -1,6 +1,6 @@
 import type { TaskTemplate } from "./create";
 import type { AgentOption } from "./common";
-import type { GenerationPolicyRecord, SchedulerConfigRecord, StallWatchdogPolicyRecord, WorkspaceUser } from "./workspace";
+import type { GenerationPolicyRecord, SchedulerConfigRecord, SchedulerRevision, StallWatchdogPolicyRecord, WorkspaceUser } from "./workspace";
 
 export interface ResourceAgentBindingModel {
   kind: "profile" | "agent";
@@ -80,6 +80,24 @@ export interface WorkspaceAgentsModel extends Partial<FilePreviewModel> {
   error?: string;
 }
 
+interface SchedulerSaveFields {
+  description: string;
+  condition: string;
+  target: string;
+}
+
+export type SchedulerSaveInput = SchedulerSaveFields & (
+  | { scheduleId?: undefined; expectedRevision?: undefined }
+  | { scheduleId: string; expectedRevision: SchedulerRevision }
+);
+
+export interface SchedulerMutationCallbacks {
+  validateTarget: (target: string) => string;
+  save: (input: SchedulerSaveInput) => Promise<boolean>;
+  setPaused: (scheduleId: string, paused: boolean) => Promise<boolean>;
+  remove: (scheduleId: string) => Promise<boolean>;
+}
+
 export interface DetailPanelModel {
   identity: string;
   workspaceId: string;
@@ -118,6 +136,6 @@ export interface DetailPanelModel {
   onSaveGenerationPolicy: (policy: GenerationPolicyRecord) => Promise<void>;
   onSaveStallWatchdogPolicy: (policy: StallWatchdogPolicyRecord) => Promise<void>;
   onSaveTaskDefault: (projectId: string, binding: ResourceAgentBindingModel | null) => Promise<void>;
-  onRefreshScheduler?: () => Promise<void>;
+  schedulerActions?: SchedulerMutationCallbacks;
   onToast: (message: string) => void;
 }

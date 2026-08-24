@@ -91,8 +91,8 @@
     }
   }
 
-  async function steerWaiting(messageId: string): Promise<void> {
-    if (!model.canSteerWaiting || model.steeringMessageId) return;
+  async function steerWaiting(messageId: string, canPromote: boolean): Promise<void> {
+    if (!canPromote || !model.canSteerWaiting || model.steeringMessageId) return;
     queueError = "";
     try {
       await model.onSteerWaiting(messageId);
@@ -141,7 +141,7 @@
         <div class="chat-message-item" data-message-id={message.messageId}>
           <span class="chat-message-text" title={message.text}>{message.text}</span>
           <span class="chat-message-mode">{message.actualMode || message.requestedMode}</span>
-          <button type="button" class="chat-message-steer" disabled={!model.canSteerWaiting || Boolean(model.steeringMessageId)} title={model.canSteerWaiting ? "Insert this waiting message into the current turn" : "Available when the current turn supports steer"} aria-label={`Insert waiting message into current turn: ${message.text}`} onclick={() => steerWaiting(message.messageId)}>
+          <button type="button" class="chat-message-steer" disabled={!message.canPromote || !model.canSteerWaiting || Boolean(model.steeringMessageId)} title={!message.canPromote ? "This generated message cannot be inserted into another turn" : model.canSteerWaiting ? "Insert this waiting message into the current turn" : "Available when the current turn supports steer"} aria-label={`Insert waiting message into current turn: ${message.text}`} onclick={() => steerWaiting(message.messageId, message.canPromote)}>
             {#if model.steeringMessageId === message.messageId}<Icon name="loader-circle" />{:else}<Icon name="corner-up-left" />{/if}
             <span>Insert now</span>
           </button>

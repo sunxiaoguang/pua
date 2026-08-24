@@ -21,7 +21,7 @@ project, err := workspace.CreateProjectWithInput(app.CreateProjectInput{
 - `OpenWorkspace`、`OpenWorkspaceFrom`、`Initialize`、`InitializeWithOptions`、`Migrate`：打开、发现、初始化或迁移 Workspace；
 - `NormalizeProjectID`、`NormalizeTaskName`、`NormalizeTaskID`、`InferProjectID`、`InferTaskID`：集中实现 CLI 使用的资源选择规则；
 - `Tree`、`Resource`、`Projects`、`Tasks`：读取 Workspace 资源视图；
-- `EnsureScheduler`、`Scheduler`、`AddSchedule`、`UpdateSchedule`、`RemoveSchedule`、`SetSchedulerSettings`：创建、读取和原子修改特殊 Scheduler 资源；
+- `EnsureScheduler`、`Scheduler`、`AddSchedule`、`UpdateSchedule`、`PauseSchedule`、`ResumeSchedule`、`RemoveSchedule`：创建、读取和原子修改 schema v2 Scheduler 定义；
 - `Templates`、`Template`、`RenderTemplate`、`ValidateTemplateContent`、`CreateTemplate`、`MigrateTemplates`：模板发现、结构化校验、确定性渲染、脚手架和 V1 内容迁移；
 - `PreviewTask`：无副作用地计算最终标题、Markdown、最终 Agent binding 与模板 digest；
 - `CreateProject`、`CreateProjectWithInput`、`CreateTask`、`ArchiveResource`：资源生命周期。`ArchiveResource` 以可恢复目录移动为唯一提交点；Project 归档级联移动完整子树，Git 预检、开放子任务和移动后 worktree 修复问题通过 `ArchiveResult.Warnings` 返回，不会修改源码或阻断移动；
@@ -33,4 +33,4 @@ project, err := workspace.CreateProjectWithInput(app.CreateProjectInput{
 
 Workspace、Project 和 Task 的新建接口把 ID 分配、全部资源文件一起放在 mutation lock 的同一提交边界内。Project/Task 先写同文件系统 staging 目录，再原子 rename；Workspace 初始化使用 `.pua/initializing.json` 作为可恢复标记。旧 resource JSON 中的 creator/createdBy 字段只由一次性迁移清理，正常 API 不读取或写入这些字段。
 
-Scheduler 是固定 ID `scheduler` 的 Workspace 特殊资源，工作目录为 `scheduler/`。初始化和迁移只创建缺失文件、校验冲突并刷新 `AGENTS.md` 的 PUA managed block，不覆盖 `scheduler.md` 或已有调度项。`scheduler.json` 使用严格 schema 和格式化 JSON；所有修改与其他 Workspace 写入共享 mutation lock，并通过同目录临时文件、fsync、rename 和目录 fsync 原子提交。应用层只校验同 Workspace 的开放目标资源，不解释自然语言条件或 generation 执行状态。
+Scheduler 是固定 ID `scheduler` 的 Workspace 特殊资源，工作目录为 `scheduler/`。初始化和迁移只创建缺失文件、校验冲突并刷新 `AGENTS.md` 的 PUA managed block，不覆盖 `scheduler.md`。`scheduler.json` 使用严格 schema v2 和格式化 JSON；所有修改与其他 Workspace 写入共享 mutation lock，并通过同目录临时文件、fsync、rename 和目录 fsync 原子提交。应用层校验 tagged-union trigger、最短间隔、六字段 cron、IANA 时区、开放目标和 revision CAS；它不保存运行游标，也不解释 guard。v1 迁移原样保留定义并标记 `needs_compilation`。

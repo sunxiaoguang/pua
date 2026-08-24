@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/disksing/pua/internal/app"
 )
 
 const (
@@ -70,6 +72,7 @@ type resourceMailboxReceipt struct {
 	RequestedMode             string                       `json:"requestedMode"`
 	ActualMode                string                       `json:"actualMode"`
 	ModeFrozen                bool                         `json:"modeFrozen,omitempty"`
+	NonPromotable             bool                         `json:"nonPromotable,omitempty"`
 	DowngradeReason           string                       `json:"downgradeReason,omitempty"`
 	Status                    string                       `json:"status"`
 	AcceptedAt                string                       `json:"acceptedAt"`
@@ -165,18 +168,45 @@ type resourceMailboxNotificationOp struct {
 }
 
 type resourceSchedulerCheckpoint struct {
-	Version            int    `json:"version"`
-	ResourceID         string `json:"resourceId"`
-	LastTickMessageID  string `json:"lastTickMessageId,omitempty"`
-	GenerationID       string `json:"generationId,omitempty"`
-	AgentHubSessionID  string `json:"agentHubSessionId,omitempty"`
-	TurnID             string `json:"turnId,omitempty"`
-	ConfigDigest       string `json:"configDigest,omitempty"`
-	Reason             string `json:"reason,omitempty"`
-	AcceptedAt         string `json:"acceptedAt,omitempty"`
-	DeliveryTerminalAt string `json:"deliveryTerminalAt,omitempty"`
-	TurnTerminalAt     string `json:"turnTerminalAt,omitempty"`
-	TurnStatus         string `json:"turnStatus,omitempty"`
+	Version         int                                 `json:"version"`
+	ResourceID      string                              `json:"resourceId"`
+	MigrationDigest string                              `json:"migrationDigest,omitempty"`
+	Schedules       map[string]schedulerScheduleRuntime `json:"schedules,omitempty"`
+}
+
+type schedulerScheduleRuntime struct {
+	Revision           uint64                       `json:"revision"`
+	ActivationRevision uint64                       `json:"activationRevision,omitempty"`
+	TriggerDigest      string                       `json:"triggerDigest,omitempty"`
+	Target             string                       `json:"target,omitempty"`
+	EffectiveState     string                       `json:"effectiveState,omitempty"`
+	NextRunAt          string                       `json:"nextRunAt,omitempty"`
+	LastOccurrenceAt   string                       `json:"lastOccurrenceAt,omitempty"`
+	LastOutcome        string                       `json:"lastOutcome,omitempty"`
+	LastError          string                       `json:"lastError,omitempty"`
+	AttentionTarget    string                       `json:"attentionTarget,omitempty"`
+	RetryAt            string                       `json:"retryAt,omitempty"`
+	RetryCount         int                          `json:"retryCount,omitempty"`
+	Prepared           *schedulerPreparedOccurrence `json:"preparedOccurrence,omitempty"`
+}
+
+type schedulerPreparedOccurrence struct {
+	ScheduleID            string                    `json:"scheduleId"`
+	ScheduleRevision      uint64                    `json:"scheduleRevision"`
+	OccurrenceID          string                    `json:"occurrenceId"`
+	MessageID             string                    `json:"messageId"`
+	Target                string                    `json:"target"`
+	Text                  string                    `json:"text"`
+	ScheduledFor          string                    `json:"scheduledFor"`
+	CoalescedThrough      string                    `json:"coalescedThrough,omitempty"`
+	CoalescedCount        int                       `json:"coalescedCount,omitempty"`
+	CronEnumerationCapped bool                      `json:"cronEnumerationCapped,omitempty"`
+	EnumeratedThrough     string                    `json:"enumeratedThrough,omitempty"`
+	EnumeratedCount       int                       `json:"enumeratedCount,omitempty"`
+	RecoveryCutoff        string                    `json:"recoveryCutoff,omitempty"`
+	NextRunAt             string                    `json:"nextRunAt,omitempty"`
+	Reason                string                    `json:"reason"`
+	Causation             *resourceMessageCausation `json:"causation"`
 }
 
 type resourceMailboxMeta struct {
@@ -452,7 +482,7 @@ func receiptFromMailboxMessage(message resourceMailboxMessage) resourceMailboxRe
 		Role: message.Role, Sender: sender, SenderWorkspaceInstanceID: message.SenderWorkspaceInstanceID,
 		SubscribeResult: message.SubscribeResult, ResultSubscriptionStatus: message.ResultSubscriptionStatus, ResultOperationID: message.ResultOperationID,
 		Type: message.Type, Causation: cloneMailboxCausation(message.Causation), Notification: cloneNotificationReceipt(message.Notification),
-		RequestedMode: message.RequestedMode, ActualMode: message.ActualMode, ModeFrozen: message.ModeFrozen,
+		RequestedMode: message.RequestedMode, ActualMode: message.ActualMode, ModeFrozen: message.ModeFrozen, NonPromotable: message.NonPromotable,
 		DowngradeReason: message.DowngradeReason, Status: message.Status, AcceptedAt: message.AcceptedAt,
 		UpdatedAt: message.UpdatedAt, DeliveredAt: message.DeliveredAt, TerminalAt: message.TerminalAt,
 		TurnTerminalAt: message.TurnTerminalAt, GenerationID: message.GenerationID,
@@ -474,7 +504,7 @@ func mailboxMessageFromReceipt(receipt resourceMailboxReceipt) resourceMailboxMe
 		Role: receipt.Role, Sender: sender, SenderWorkspaceInstanceID: receipt.SenderWorkspaceInstanceID,
 		SubscribeResult: receipt.SubscribeResult, ResultSubscriptionStatus: receipt.ResultSubscriptionStatus, ResultOperationID: receipt.ResultOperationID,
 		Type: receipt.Type, Causation: cloneMailboxCausation(receipt.Causation), Notification: cloneNotificationReceipt(receipt.Notification),
-		RequestedMode: receipt.RequestedMode, ActualMode: receipt.ActualMode, ModeFrozen: receipt.ModeFrozen,
+		RequestedMode: receipt.RequestedMode, ActualMode: receipt.ActualMode, ModeFrozen: receipt.ModeFrozen, NonPromotable: receipt.NonPromotable,
 		DowngradeReason: receipt.DowngradeReason, Status: receipt.Status, AcceptedAt: receipt.AcceptedAt,
 		UpdatedAt: receipt.UpdatedAt, DeliveredAt: receipt.DeliveredAt, TerminalAt: receipt.TerminalAt,
 		TurnTerminalAt: receipt.TurnTerminalAt, GenerationID: receipt.GenerationID,
@@ -554,7 +584,24 @@ func cloneResourceMailboxStore(store resourceMailboxStore) resourceMailboxStore 
 	for _, operation := range store.Outbox.Operations {
 		cloned.Outbox.Operations = append(cloned.Outbox.Operations, cloneMailboxOperation(operation))
 	}
+	cloned.Scheduler.Schedules = cloneSchedulerRuntimes(store.Scheduler.Schedules)
 	return cloned
+}
+
+func cloneSchedulerRuntimes(values map[string]schedulerScheduleRuntime) map[string]schedulerScheduleRuntime {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string]schedulerScheduleRuntime, len(values))
+	for id, runtime := range values {
+		if runtime.Prepared != nil {
+			prepared := *runtime.Prepared
+			prepared.Causation = cloneMailboxCausation(runtime.Prepared.Causation)
+			runtime.Prepared = &prepared
+		}
+		result[id] = runtime
+	}
+	return result
 }
 
 func defaultResourceMailboxStore(workspacePath, resourceID string) resourceMailboxStore {
@@ -697,31 +744,12 @@ func mailboxMessageNeedsHot(message resourceMailboxMessage) bool {
 	return false
 }
 
-func latestSchedulerTickNeedingHot(messages []resourceMailboxMessage) string {
-	var latest resourceMailboxMessage
-	found := false
-	for _, message := range messages {
-		if message.Type != resourceMessageTypeSchedulerTick {
-			continue
-		}
-		if !found || message.Sequence > latest.Sequence || (message.Sequence == latest.Sequence && message.ID > latest.ID) {
-			latest = message
-			found = true
-		}
-	}
-	if !found || latest.receipt || latest.Status != resourceMessageDelivered || strings.TrimSpace(latest.TurnTerminalAt) != "" {
-		return ""
-	}
-	return latest.ID
-}
-
 func resourceMailboxStoreNeedsHotWork(store resourceMailboxStore) bool {
-	schedulerTickID := latestSchedulerTickNeedingHot(store.Mailbox.Messages)
 	for _, message := range store.Mailbox.Messages {
 		if message.receipt {
 			continue
 		}
-		if message.ID == schedulerTickID || mailboxMessageNeedsHot(message) {
+		if mailboxMessageNeedsHot(message) {
 			return true
 		}
 	}
@@ -733,10 +761,21 @@ func resourceMailboxStoreNeedsHotWork(store resourceMailboxStore) bool {
 	return false
 }
 
+// resourceMailboxHasHotWork reports whether the mailbox controller still owns
+// any work for a resource. Keep callers on the same predicate that controls
+// hot-store persistence and hot-index membership so new controller obligations
+// cannot silently drift from resource busy checks.
+func resourceMailboxHasHotWork(workspacePath, resourceID string) (bool, error) {
+	store, err := loadResourceMailboxStoreForRead(workspacePath, resourceID)
+	if err != nil {
+		return false, err
+	}
+	return resourceMailboxStoreNeedsHotWork(store), nil
+}
+
 func resourceMailboxStoreNeedsCompaction(store resourceMailboxStore) bool {
-	schedulerTickID := latestSchedulerTickNeedingHot(store.Mailbox.Messages)
 	for _, message := range store.Mailbox.Messages {
-		if message.receipt || message.ID == schedulerTickID || mailboxMessageNeedsHot(message) {
+		if message.receipt || mailboxMessageNeedsHot(message) {
 			continue
 		}
 		return true
@@ -911,6 +950,14 @@ func normalizeStoredMailboxMessage(message *resourceMailboxMessage) {
 	if message == nil {
 		return
 	}
+	// Fixed-base generated messages predate the explicit promotion policy.
+	// Their system role plus typed causation is the durable signature imposed
+	// by acceptGeneratedMailboxMessage, while ordinary persisted enqueues have
+	// neither. ModeFrozen cannot be used here: older ordinary enqueues waiting
+	// behind an active Turn were persisted frozen but remained promotable.
+	if message.Role == "system" && message.Type != "" && message.Causation != nil {
+		message.NonPromotable = true
+	}
 	if !message.subscribeResultPresent && message.Status == resourceMessageDelivered && message.Notification == nil && message.Type == "" {
 		message.SubscribeResult = false
 		message.ResultSubscriptionStatus = resourceResultSubscriptionNone
@@ -930,6 +977,9 @@ func normalizeStoredMailboxMessage(message *resourceMailboxMessage) {
 func normalizeStoredMailboxReceipt(receipt *resourceMailboxReceipt) {
 	if receipt == nil {
 		return
+	}
+	if receipt.Role == "system" && receipt.Type != "" && receipt.Causation != nil {
+		receipt.NonPromotable = true
 	}
 	if !receipt.subscribeResultPresent && receipt.Status == resourceMessageDelivered && receipt.Notification == nil && receipt.Type == "" {
 		receipt.SubscribeResult = false
@@ -981,7 +1031,60 @@ func uniqueMailboxReceipts(receipts []resourceMailboxReceipt) []resourceMailboxR
 	return result
 }
 
-func prepareResourceMailboxDocuments(store resourceMailboxStore) (resourceMailboxHotDocument, resourceMailboxReceiptDocument, resourceMailboxOutboxDocument, resourceSchedulerCheckpoint) {
+func schedulerPreparedMessagePins(workspacePath string, store resourceMailboxStore) (map[string]bool, error) {
+	checkpoint := store.Scheduler
+	if store.ResourceID != app.SchedulerResourceID {
+		// Target persistence already holds this resource's mailbox lock. Read the
+		// Scheduler's atomically renamed checkpoint directly so delivery never
+		// acquires the source lock in the opposite order. An in-progress source
+		// commit exposes the older final file, which only retains evidence longer.
+		schedulerStore := defaultResourceMailboxStore(workspacePath, app.SchedulerResourceID)
+		var persisted resourceSchedulerCheckpoint
+		found, err := readResourceMailboxJSON(resourceMailboxSchedulerPath(schedulerStore.Directory), &persisted)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return map[string]bool{}, nil
+		}
+		checkpoint = persisted
+	}
+
+	pins := make(map[string]bool)
+	if store.ResourceID == app.SchedulerResourceID {
+		for _, message := range store.Mailbox.Messages {
+			if message.Type != resourceMessageTypeSchedulerTick || strings.TrimSpace(message.TurnTerminalAt) != "" {
+				continue
+			}
+			switch message.Status {
+			case resourceMessageDelivering, resourceMessageInterrupting, resourceMessageDeliveryUnknown, resourceMessageDelivered:
+				// Native migration must reconcile uncertain acceptance and
+				// delivered Turns against AgentHub before discarding their
+				// identity. Otherwise startup compaction can erase the only
+				// receipt that distinguishes an obsolete active Turn from an
+				// unrelated Scheduler chat.
+				pins[strings.TrimSpace(message.ID)] = true
+			}
+		}
+	}
+	for _, runtime := range checkpoint.Schedules {
+		prepared := runtime.Prepared
+		if prepared == nil || strings.TrimSpace(prepared.MessageID) == "" {
+			continue
+		}
+		target := strings.TrimSpace(prepared.Target)
+		if target == "" {
+			target = strings.TrimSpace(runtime.Target)
+		}
+		if target == "" || normalizedResourceID(target) != store.ResourceID {
+			continue
+		}
+		pins[strings.TrimSpace(prepared.MessageID)] = true
+	}
+	return pins, nil
+}
+
+func prepareResourceMailboxDocuments(store resourceMailboxStore, pinnedMessageIDs map[string]bool) (resourceMailboxHotDocument, resourceMailboxReceiptDocument, resourceMailboxOutboxDocument, resourceSchedulerCheckpoint) {
 	byID := make(map[string]resourceMailboxMessage, len(store.Mailbox.Messages))
 	for _, message := range store.Mailbox.Messages {
 		if strings.TrimSpace(message.ID) == "" {
@@ -994,12 +1097,11 @@ func prepareResourceMailboxDocuments(store resourceMailboxStore) (resourceMailbo
 	for _, message := range byID {
 		messages = append(messages, message)
 	}
-	schedulerTickID := latestSchedulerTickNeedingHot(messages)
 	hot := resourceMailboxHotDocument{Version: resourceMailboxStoreVersion, ResourceID: store.ResourceID, NextSequence: store.Mailbox.NextSequence, Messages: []resourceMailboxMessage{}}
 	receipts := append([]resourceMailboxReceipt(nil), store.Receipts.Receipts...)
 	hotIDs := make(map[string]bool)
 	for _, message := range byID {
-		if message.ID == schedulerTickID || mailboxMessageNeedsHot(message) {
+		if mailboxMessageNeedsHot(message) {
 			message.receipt = false
 			hot.Messages = append(hot.Messages, message)
 			hotIDs[message.ID] = true
@@ -1025,10 +1127,15 @@ func prepareResourceMailboxDocuments(store resourceMailboxStore) (resourceMailbo
 	now := time.Now()
 	retained := make([]resourceMailboxReceipt, 0, len(receipts))
 	dropped := make([]resourceMailboxExpiredEntry, 0)
-	for index, receipt := range receipts {
+	ordinaryReceiptIndex := 0
+	for _, receipt := range receipts {
+		pinned := pinnedMessageIDs[receipt.ID]
 		receiptTime := mailboxReceiptRetentionTime(receipt)
-		keepByTime := receiptTime.IsZero() || resourceMailboxReceiptRetentionWindow <= 0 || now.Sub(receiptTime) <= resourceMailboxReceiptRetentionWindow
-		keepByCount := resourceMailboxReceiptRetentionCount <= 0 || index < resourceMailboxReceiptRetentionCount
+		keepByTime := pinned || receiptTime.IsZero() || resourceMailboxReceiptRetentionWindow <= 0 || now.Sub(receiptTime) <= resourceMailboxReceiptRetentionWindow
+		keepByCount := pinned || resourceMailboxReceiptRetentionCount <= 0 || ordinaryReceiptIndex < resourceMailboxReceiptRetentionCount
+		if !pinned {
+			ordinaryReceiptIndex++
+		}
 		if keepByTime && keepByCount {
 			retained = append(retained, receipt)
 		} else {
@@ -1047,7 +1154,7 @@ func prepareResourceMailboxDocuments(store resourceMailboxStore) (resourceMailbo
 	expired = expired[:0]
 	for _, entry := range expiredByID {
 		parsed, parseErr := time.Parse(time.RFC3339Nano, entry.ExpiredAt)
-		if parseErr == nil && resourceMailboxExpiredRetentionWindow > 0 && now.Sub(parsed) > resourceMailboxExpiredRetentionWindow {
+		if !pinnedMessageIDs[entry.ID] && parseErr == nil && resourceMailboxExpiredRetentionWindow > 0 && now.Sub(parsed) > resourceMailboxExpiredRetentionWindow {
 			continue
 		}
 		expired = append(expired, entry)
@@ -1067,8 +1174,18 @@ func prepareResourceMailboxDocuments(store resourceMailboxStore) (resourceMailbo
 	}
 	expired = filteredExpired
 	sort.SliceStable(expired, func(i, j int) bool { return expired[i].ExpiredAt > expired[j].ExpiredAt })
-	if resourceMailboxExpiredRetentionCount > 0 && len(expired) > resourceMailboxExpiredRetentionCount {
-		expired = expired[:resourceMailboxExpiredRetentionCount]
+	if resourceMailboxExpiredRetentionCount > 0 {
+		bounded := make([]resourceMailboxExpiredEntry, 0, len(expired))
+		ordinaryExpiredCount := 0
+		for _, entry := range expired {
+			if pinnedMessageIDs[entry.ID] || ordinaryExpiredCount < resourceMailboxExpiredRetentionCount {
+				bounded = append(bounded, entry)
+			}
+			if !pinnedMessageIDs[entry.ID] {
+				ordinaryExpiredCount++
+			}
+		}
+		expired = bounded
 	}
 	receiptDoc := resourceMailboxReceiptDocument{Version: resourceMailboxStoreVersion, ResourceID: store.ResourceID, Receipts: retained, Expired: expired}
 	outbox := store.Outbox
@@ -1235,7 +1352,11 @@ func updateResourceMailboxLocators(workspacePath string, store resourceMailboxSt
 }
 
 func persistResourceMailboxStore(workspacePath string, store resourceMailboxStore, before resourceMailboxStore) error {
-	hot, receipts, outbox, scheduler := prepareResourceMailboxDocuments(store)
+	pinnedMessageIDs, err := schedulerPreparedMessagePins(workspacePath, store)
+	if err != nil {
+		return err
+	}
+	hot, receipts, outbox, scheduler := prepareResourceMailboxDocuments(store, pinnedMessageIDs)
 	active := resourceMailboxStoreNeedsHotWork(store)
 	if active {
 		// Keep the marker and mailbox commit in one ordering boundary. If the
@@ -1559,32 +1680,6 @@ func appendUniqueMailboxOperation(operations []resourceMailboxNotificationOp, op
 		return operations
 	}
 	return append(operations, cloneMailboxOperation(operation))
-}
-
-func schedulerCheckpointFromMessages(resourceID string, messages []resourceMailboxMessage) resourceSchedulerCheckpoint {
-	checkpoint := resourceSchedulerCheckpoint{Version: resourceMailboxStoreVersion, ResourceID: resourceID}
-	var latest resourceMailboxMessage
-	found := false
-	for _, message := range messages {
-		if message.Type == resourceMessageTypeSchedulerTick && (!found || message.Sequence > latest.Sequence) {
-			latest, found = message, true
-		}
-	}
-	if !found {
-		return checkpoint
-	}
-	checkpoint.LastTickMessageID = latest.ID
-	checkpoint.GenerationID = latest.GenerationID
-	checkpoint.AgentHubSessionID = latest.AgentHubSessionID
-	checkpoint.TurnID = latest.TurnID
-	checkpoint.AcceptedAt = latest.AcceptedAt
-	checkpoint.DeliveryTerminalAt = latest.TerminalAt
-	checkpoint.TurnTerminalAt = latest.TurnTerminalAt
-	if latest.Causation != nil {
-		checkpoint.ConfigDigest = latest.Causation.ScheduleDigest
-		checkpoint.Reason = latest.Causation.Reason
-	}
-	return checkpoint
 }
 
 func readResourceMailboxLocator(workspacePath, messageID string) (resourceMailboxLocator, bool, error) {
